@@ -1269,6 +1269,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
       inputSchema: z.object({
         action: z.enum(['spawn', 'message', 'status', 'finish']).describe('What to do.'),
         run_id: z.string().uuid().optional().describe('Select your returned worker family when status lists several; never grants another caller’s workers.'),
+        // ECOM-controlled spawns must supply evidence through the trusted host, not model text.
         context: z
           .string()
           .max(4000)
@@ -1385,6 +1386,8 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           if (await managedWorkerIsolationRequired(spawnCaller) && !managedWorkerAllocationIdentity(spawnCaller)) {
             return fail('WORKTREE_OWNER_UNAVAILABLE: a retired worker cannot create a prime run after its isolated checkout owner was lost.');
           }
+          // ECOM canonical missions require the authenticated host to provide ecomSource;
+          // model-provided context is never treated as authorization or a canonical lease.
           const { created, becamePrime, runId, defaultNotes, isolationNotes } = await spawnAgentWorkers({
             workers: input.workers,
             context: input.context ?? null,

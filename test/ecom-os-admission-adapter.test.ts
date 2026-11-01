@@ -16,6 +16,16 @@ describe('CoS canonical admission adapter',()=>{
     const gate=ecomWorkerAdmission({readCurrent:async()=>approved,assertCurrent:()=>({...approved,writerFenced:false})});
     expect(()=>gate.assertCurrent()).toThrow('WRITER_FENCING_UNVERIFIED');
   });
+  it('fails closed when the canonical controller is unreachable', async()=>{
+    const gate=ecomWorkerAdmission({readCurrent:async()=>{throw new Error('CONTROLLER_OFFLINE');},assertCurrent:()=>{throw new Error('CONTROLLER_OFFLINE');}});
+    await expect(gate.validate()).rejects.toThrow('CONTROLLER_OFFLINE');
+    expect(()=>gate.assertCurrent()).toThrow('CONTROLLER_OFFLINE');
+  });
+  it('rejects a revision that changed between the two barriers',async()=>{
+    const gate=ecomWorkerAdmission({readCurrent:async()=>approved,assertCurrent:()=>({...approved,canonicalRevisionMatches:false})});
+    await gate.validate();
+    expect(()=>gate.assertCurrent()).toThrow('CANONICAL_REVISION_MISMATCH');
+  });
   it('denies lost canonical lease at synchronous commit barrier',()=>{
     const gate=ecomWorkerAdmission({readCurrent:async()=>approved,assertCurrent:()=>({...approved,leaseFresh:false})});
     expect(()=>gate.assertCurrent()).toThrow('NO_FRESH_CANONICAL_LEASE');

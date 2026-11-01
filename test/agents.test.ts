@@ -5207,6 +5207,34 @@ describe('simultaneous independent prime families', () => {
     }
   });
 
+  it('reports effective admission slots across active and staged families without exposing worker identities', async () => {
+    await setEnabled(true, 2, false, 2);
+    try {
+      expect(statusForCaller(primeB)).toMatchObject({
+        freeWorkerSlots: 2, admissibleWorkerSlots: 2, runId: null
+      });
+
+      const pending = stageSpawn({ caller: prime, workers: [{ task: 'staged capacity reservation' }] });
+      expect(statusForCaller(primeB).admissibleWorkerSlots).toBe(1);
+      pending.rollback();
+      expect(statusForCaller(primeB).admissibleWorkerSlots).toBe(2);
+
+      const a = recruit(prime, 2);
+      const other = statusForCaller(primeB);
+      expect(other.freeWorkerSlots).toBe(2);
+      expect(other.admissibleWorkerSlots).toBe(0);
+      expect(other.state.agents).toEqual([]);
+      expect(statusForCaller(prime).admissibleWorkerSlots).toBe(0);
+
+      expect(bindConversation('worker-1', 'parallel-capacity-worker-a', a.runId)).toBe(true);
+      finishAgent({ conversationId: 'parallel-capacity-worker-a' }, 'A releases its global admission');
+      expect(statusForCaller(primeB).admissibleWorkerSlots).toBe(1);
+      expect(statusForCaller(prime).admissibleWorkerSlots).toBe(1);
+    } finally {
+      await setEnabled(true);
+    }
+  });
+
   it('counts an unpublished staged spawn as a global admission reservation', async () => {
     await setEnabled(true, 2, false, 1);
     try {

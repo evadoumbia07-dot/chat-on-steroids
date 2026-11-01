@@ -1,3 +1,4 @@
+import type { EcomAdmissionSource } from '../ecom-os-admission-adapter.js';
 import { toolDeclaration } from './tool-declarations.js';
 import { registerPlanTool } from './plan-tool.js';
 import { goalWorkerChat, imageExportCapable } from '../bridge.js';
@@ -261,7 +262,7 @@ function execPrincipal(): string | null {
  */
 const SERVER_SHELL = { shellType: 'sh', shellPath: 'sh' } as const;
 
-export function registerCoreTools(reg: SurfaceRegistrar): void {
+export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: (caller: Caller) => EcomAdmissionSource | undefined): void {
   const { ctx, caps, exposedCaps } = reg;
   // Named from the live roots, never from a `/project` that may not exist: a worked example the
   // model cannot act on costs a refused call and a retry. What followed the root had the same
@@ -1396,7 +1397,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
             const sessionId = currentCall()?.caller.sessionId;
             return (sessionId ? await getSessionProject(sessionId) : null) ??
               primeWorkspace(currentCaller().conversationId) ?? currentWorkspace();
-          }, () => !reg.ctx.readOnly && reg.caps.command && reg.caps.create && reg.caps.edit);
+          }, () => !reg.ctx.readOnly && reg.caps.command && reg.caps.create && reg.caps.edit, undefined, trustedEcomAdmission?.(spawnCaller));
           if (currentCall()) currentCall()!.caller.runId = runId;
           // Browser tabs are a publication side effect, never part of planning. They become
           // visible only after the exact broker revision above is durable.

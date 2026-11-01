@@ -1315,6 +1315,8 @@ export interface CallerSwarmStatus {
   runId: string | null;
   /** Capacity available inside this caller's own worker family, before any optional global cap. */
   freeWorkerSlots: number;
+  /** Free admissions after both family and global broker limits (not host/provider capacity). */
+  admissibleWorkerSlots: number;
 }
 
 /** One caller-scoped status snapshot, so no global run id/slot count can leak across owners. */
@@ -1332,7 +1334,8 @@ export function statusForCaller(caller: Caller): CallerSwarmStatus {
         self: { ...member.info },
         state: stateForAgents(run.agents, true),
         runId: run.runId,
-        freeWorkerSlots: freeWorkerSlots(run.runId)
+        freeWorkerSlots: freeWorkerSlots(run.runId),
+        admissibleWorkerSlots: Math.min(freeWorkerSlots(run.runId), globalFreeWorkerSlots())
       };
     }
   }
@@ -1344,11 +1347,13 @@ export function statusForCaller(caller: Caller): CallerSwarmStatus {
       self: { ...member.info },
       state: stateForAgents(dormant.agents, false),
       runId: null,
-      freeWorkerSlots: getConfig().multiAgent.maxWorkers
+      freeWorkerSlots: getConfig().multiAgent.maxWorkers,
+      admissibleWorkerSlots: Math.min(getConfig().multiAgent.maxWorkers, globalFreeWorkerSlots())
     };
   }
   return { self: null, state: stateForAgents(new Map(), false, false), runId: null,
-    freeWorkerSlots: getConfig().multiAgent.maxWorkers };
+    freeWorkerSlots: getConfig().multiAgent.maxWorkers,
+    admissibleWorkerSlots: Math.min(getConfig().multiAgent.maxWorkers, globalFreeWorkerSlots()) };
 }
 
 /**

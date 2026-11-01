@@ -1,3 +1,4 @@
+import type { EcomAdmissionSource } from '../ecom-os-admission-adapter.js';
 import { toolDeclaration } from './tool-declarations.js';
 import { registerPlanTool } from './plan-tool.js';
 import { goalWorkerChat, imageExportCapable } from '../bridge.js';
@@ -261,7 +262,7 @@ function execPrincipal(): string | null {
  */
 const SERVER_SHELL = { shellType: 'sh', shellPath: 'sh' } as const;
 
-export function registerCoreTools(reg: SurfaceRegistrar): void {
+export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: (caller: Caller) => EcomAdmissionSource | undefined): void {
   const { ctx, caps, exposedCaps } = reg;
   // Named from the live roots, never from a `/project` that may not exist: a worked example the
   // model cannot act on costs a refused call and a retry. What followed the root had the same
@@ -1236,7 +1237,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
 
   // ----------------------------------------------------------------- agents
 
-  if (reg.agentToolsExposed) registerAgentsTool(reg);
+  if (reg.agentToolsExposed) registerAgentsTool(reg, trustedEcomAdmission);
 }
 
 
@@ -1257,7 +1258,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
  * act on and is kept to a sentence or two; ids, states and counts are machine state and belong
  * in a shape the caller can read without parsing English.
  */
-function registerAgentsTool(reg: SurfaceRegistrar): void {
+function registerAgentsTool(reg: SurfaceRegistrar, trustedEcomAdmission?: (caller: Caller) => EcomAdmissionSource | undefined): void {
   reg.register(
     'agents',
     toolDeclaration('agents', () => ({
@@ -1269,6 +1270,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
       inputSchema: z.object({
         action: z.enum(['spawn', 'message', 'status', 'finish']).describe('What to do.'),
         run_id: z.string().uuid().optional().describe('Select your returned worker family when status lists several; never grants another caller’s workers.'),
+        // ECOM-controlled spawns must supply evidence through the trusted host, not model text.
         context: z
           .string()
           .max(4000)
@@ -1385,6 +1387,8 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           if (await managedWorkerIsolationRequired(spawnCaller) && !managedWorkerAllocationIdentity(spawnCaller)) {
             return fail('WORKTREE_OWNER_UNAVAILABLE: a retired worker cannot create a prime run after its isolated checkout owner was lost.');
           }
+          // ECOM canonical missions require the authenticated host to provide ecomSource;
+          // model-provided context is never treated as authorization or a canonical lease.
           const { created, becamePrime, runId, defaultNotes, isolationNotes } = await spawnAgentWorkers({
             workers: input.workers,
             context: input.context ?? null,
@@ -1393,7 +1397,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
             const sessionId = currentCall()?.caller.sessionId;
             return (sessionId ? await getSessionProject(sessionId) : null) ??
               primeWorkspace(currentCaller().conversationId) ?? currentWorkspace();
-          }, () => !reg.ctx.readOnly && reg.caps.command && reg.caps.create && reg.caps.edit);
+          }, () => !reg.ctx.readOnly && reg.caps.command && reg.caps.create && reg.caps.edit, undefined, trustedEcomAdmission?.(spawnCaller));
           if (currentCall()) currentCall()!.caller.runId = runId;
           // Browser tabs are a publication side effect, never part of planning. They become
           // visible only after the exact broker revision above is durable.

@@ -1,0 +1,27 @@
+name: ECOM OS CoS integration checks
+on:
+  pull_request:
+    paths:
+      - 'src/main/agents.ts'
+      - 'src/main/agent-admission.ts'
+      - 'src/main/ecom-os-admission-adapter.ts'
+      - 'src/shared/ecom-os-*.ts'
+      - 'test/agents.test.ts'
+      - 'test/ecom-os-*.test.ts'
+      - '.github/workflows/ecom-os-integration.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npx vitest run test/ecom-os-admission.test.ts test/ecom-os-admission-adapter.test.ts test/ecom-os-recovery.test.ts test/agents.test.ts --maxWorkers=1

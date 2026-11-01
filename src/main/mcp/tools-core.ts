@@ -1237,7 +1237,7 @@ export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: 
 
   // ----------------------------------------------------------------- agents
 
-  if (reg.agentToolsExposed) registerAgentsTool(reg);
+  if (reg.agentToolsExposed) registerAgentsTool(reg, trustedEcomAdmission);
 }
 
 
@@ -1258,7 +1258,7 @@ export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: 
  * act on and is kept to a sentence or two; ids, states and counts are machine state and belong
  * in a shape the caller can read without parsing English.
  */
-function registerAgentsTool(reg: SurfaceRegistrar): void {
+function registerAgentsTool(reg: SurfaceRegistrar, trustedEcomAdmission?: (caller: Caller) => EcomAdmissionSource | undefined): void {
   reg.register(
     'agents',
     toolDeclaration('agents', () => ({

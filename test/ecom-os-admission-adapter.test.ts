@@ -24,7 +24,7 @@ describe('CoS canonical admission adapter',()=>{
   it('rejects a revision that changed between the two barriers',async()=>{
     const gate=ecomWorkerAdmission({readCurrent:async()=>approved,assertCurrent:()=>({...approved,canonicalRevisionMatches:false})});
     await gate.validate();
-    expect(()=>gate.assertCurrent()).toThrow('CANONICAL_REVISION_MISMATCH');
+    expect(()=>gate.assertCurrent()).toThrow('STALE_CANONICAL_REVISION');
   });
   it('denies lost canonical lease at synchronous commit barrier',()=>{
     const gate=ecomWorkerAdmission({readCurrent:async()=>approved,assertCurrent:()=>({...approved,leaseFresh:false})});

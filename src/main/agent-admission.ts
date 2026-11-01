@@ -1,4 +1,5 @@
 import nodePath from 'node:path';
+import { ecomWorkerAdmission, type EcomAdmissionSource } from './ecom-os-admission-adapter.js';
 import { getConfig } from './config.js';
 import { noteAgentContextTokens, persistCriticalSwarmNow, stageSpawn, markStagedWorkerWorktree, swarmStateForCaller, type Caller, type SpawnInput } from './agents.js';
 import { logWarn } from './logger.js';
@@ -86,8 +87,12 @@ export async function spawnAgentWorkers(
   input: SpawnInput,
   workspace: () => Promise<WorkerWorkspace | null>,
   canIsolate: () => boolean,
-  admission?: { validate(): Promise<void>; assertCurrent(): void; workspace?: WorkerWorkspace | null }
+  admission?: { validate(): Promise<void>; assertCurrent(): void; workspace?: WorkerWorkspace | null },
+  ecomSource?: EcomAdmissionSource
 ) {
+  // ECOM-owned dispatch explicitly supplies canonical evidence. No implicit offline bypass.
+  const ecomAdmission = ecomSource ? ecomWorkerAdmission(ecomSource) : undefined;
+  ecomAdmission?.assertCurrent();
   admission?.assertCurrent();
   const staged = stageSpawn(input);
   // Newly staged admissions alone may own Git branches. A repeated spawn may show
@@ -150,15 +155,17 @@ export async function spawnAgentWorkers(
     await acceptAgentMutation(staged,
       'The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request.',
       undefined,
-      admittedLeases.length || admission ? {
+      admittedLeases.length || admission || ecomAdmission ? {
         validate: async () => {
           await admission?.validate();
+          await ecomAdmission?.validate();
           for (const lease of admittedLeases) {
             await validateWorkerWorkspaceLease(lease, getConfig().roots);
           }
         },
         assertCurrent: () => {
           admission?.assertCurrent();
+          ecomAdmission?.assertCurrent();
           if (!admittedLeases.length) return;
           const liveConfig = getConfig();
           if (liveConfig.multiAgent.autoWorktrees !== true) {

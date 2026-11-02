@@ -48,10 +48,21 @@ async function status(caller: Caller) {
       conversationId: worker.conversationId, sessionId: session?.id ?? null, revivable: worker.revivable,
       pending: worker.pending, awaitingAck: worker.awaitingAck, contextTokens: worker.contextTokens });
   }
-  return { runId: current.runId, freeWorkerSlots: current.freeWorkerSlots,
+  return { nativeBroker: nativeBrokerIdentity(caller, current.runId),
+    runId: current.runId, freeWorkerSlots: current.freeWorkerSlots,
     retainedHistory: current.state.retainedHistory === true, workers,
     // Owner-scoped native broker statistics; never a provider/ECOM SQL ACK.
     health: summarizeNativeWorkerHealth(current.state.agents.filter(agent => agent.role === 'worker')) };
+}
+
+/** An observed CoS broker identity, never an invented ECOM OS mission ID. */
+function nativeBrokerIdentity(caller: Caller, runId: string | null | undefined) {
+  return {
+    source: 'chat-on-steroids-native-broker' as const,
+    localOwnerId: caller.localOwnerId,
+    runId: runId ?? null,
+    missionAck: false as const
+  };
 }
 
 /** Reads are owner-scoped broker projections, including parked history. Reports need explicit receipts. */
@@ -68,9 +79,12 @@ export async function serveWorkerRead(route: string, params: URLSearchParams): P
   if (!result.success) throw new RequestError(400, 'invalid_query');
   const caller = { ...selected.caller, ...result.data };
   if (!selected.action) return status(caller);
-  statusForCaller(caller); // Reject foreign/unknown run selection before any inbox offer.
+  const selectedRun = statusForCaller(caller); // Reject foreign/unknown run selection before any inbox offer.
   const offered = offerMessagesForCaller(caller)?.messages ?? [];
-  return { messages: offered.map(message => ({ id: message.id, runId: message.runId ?? caller.runId ?? null,
+  // A parked family has no active run, but the requested run was already
+  // validated above. Keep its genuine identity on read-only report receipts.
+  return { nativeBroker: nativeBrokerIdentity(caller, selectedRun.runId ?? caller.runId),
+    messages: offered.map(message => ({ id: message.id, runId: message.runId ?? caller.runId ?? null,
     from: message.from, time: message.time, text: redactSecretText(message.text) })) };
 }
 

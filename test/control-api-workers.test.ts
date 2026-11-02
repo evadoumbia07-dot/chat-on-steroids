@@ -171,6 +171,10 @@ it('lets a local orchestrator spawn real broker workers without a ChatGPT prime 
   expect(result.body.workers).toMatchObject([{ id: 'worker-1', state: 'invited' }]);
   const status = await worker('status', { ownerId, runId: result.body.runId });
   expect(status.body.workers).toMatchObject([{ id: 'worker-1', state: 'invited' }]);
+  expect(status.body.nativeBroker).toEqual({
+    source: 'chat-on-steroids-native-broker',
+    localOwnerId: ownerId, runId: result.body.runId, missionAck: false
+  });
   expect(status.body.health).toMatchObject({
     total: 1, invited: 1, active: 0, failed: 0,
     pendingMessages: 0, awaitingAckMessages: 0, attention: []
@@ -185,6 +189,10 @@ it('collects exact worker reports across parking, explicitly acknowledges them, 
   broker.finishAgent({ conversationId: 'local-worker-chat' }, 'RESULT: first assignment complete');
   broker.releaseQuiescentRun({ allowPendingReports: true }, spawn.runId);
   const reports = (await worker('reports', { ownerId, runId: spawn.runId })).body;
+  expect(reports.nativeBroker).toEqual({
+    source: 'chat-on-steroids-native-broker',
+    localOwnerId: ownerId, runId: spawn.runId, missionAck: false
+  });
   expect(reports.messages).toMatchObject([{ from: 'worker-1', text: expect.stringContaining('first assignment complete') }]);
   expect((await worker('reports', { ownerId, runId: spawn.runId })).body.messages.map((row: any) => row.id)).toEqual(reports.messages.map((row: any) => row.id));
   expect((await worker('ack', { ownerId, runId: spawn.runId, messageIds: reports.messages.map((row: any) => row.id) })).body.acknowledged).toEqual(reports.messages.map((row: any) => row.id));

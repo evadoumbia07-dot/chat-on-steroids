@@ -68,8 +68,14 @@ export async function readNativeCosOwnerStatus({
     throw Error('COS_NATIVE_STATUS_INVALID');
   if (expectedRunId !== undefined && raw.runId !== expectedRunId)
     throw Error('COS_NATIVE_RUN_MISMATCH');
-  if (raw.nativeBroker?.localOwnerId && raw.nativeBroker.localOwnerId !== localOwnerId)
-    throw Error('COS_NATIVE_OWNER_MISMATCH');
+  if (raw.nativeBroker !== undefined) {
+    if (raw.nativeBroker?.localOwnerId !== localOwnerId)
+      throw Error('COS_NATIVE_OWNER_MISMATCH');
+    if (raw.nativeBroker.source !== 'chat-on-steroids-native-broker'
+      || raw.nativeBroker.runId !== raw.runId
+      || raw.nativeBroker.missionAck !== false)
+      throw Error('COS_NATIVE_BROKER_PROOF_INVALID');
+  }
   const workers = raw.workers.map(worker => {
     if (!WORKER_ID.test(worker?.id ?? '') || !STATES.has(worker?.state))
       throw Error('COS_NATIVE_WORKER_STATUS_INVALID');

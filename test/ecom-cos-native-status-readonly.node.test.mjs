@@ -76,6 +76,12 @@ test('cannot claim another owner, leak arbitrary worker state, or accept HTTP re
   const badWorker = options({ runId: run, workers: [{ id: 'fake', state: 'RUNNING' }] });
   await assert.rejects(readNativeCosOwnerStatus(badWorker.options),
     /COS_NATIVE_WORKER_STATUS_INVALID/);
+  const badBroker = options({ runId: run, nativeBroker: {
+    source: 'chat-on-steroids-native-broker', localOwnerId: owner,
+    runId: '33333333-3333-4333-8333-333333333333', missionAck: false
+  }, workers: [] });
+  await assert.rejects(readNativeCosOwnerStatus(badBroker.options),
+    /COS_NATIVE_BROKER_PROOF_INVALID/);
   const redirect = options();
   redirect.options.request = async () => ({ status: 302 });
   await assert.rejects(readNativeCosOwnerStatus(redirect.options),

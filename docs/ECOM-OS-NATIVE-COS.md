@@ -72,6 +72,14 @@ mission identity. Other owners' agents are not included. This is a
 read-only projection: no additional queue, scheduler, terminal or worker
 is created, and a CoS status must never be treated as a PostgreSQL ACK.
 
+The native status and report reads also include a `nativeBroker` receipt
+with the exact authenticated `localOwnerId`, a CoS `runId` (including
+the caller-validated historical ID for a parked report), and the explicit
+`missionAck: false`. This consolidates native provenance with the
+existing `health` summary instead of creating a second set of
+`nativeSupervision` counters or a competing broker. ECOM OS still
+requires independent source registration, lease and QA verification.
+
 The dedicated `test/native-worker-health.node.test.mjs` uses built-in
 Node test functionality and does not need a browser or API credential.
 The authenticated Control API integration contract remains covered by

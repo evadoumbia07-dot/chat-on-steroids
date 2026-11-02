@@ -7,6 +7,7 @@ import { RequestError } from './control-reads.js';
 import { projectWorkspace } from './projects.js';
 import { redactSecretText } from './redaction.js';
 import { findSessionByConversation } from './session/store.js';
+import { summarizeNativeWorkerHealth } from '../shared/native-worker-health.js';
 
 const uuid = z.string().uuid().refine(value => value === value.toLowerCase());
 const routePattern = /^\/v1\/workers\/([0-9a-f-]{36})(?:\/(spawn|message|reports|ack))?$/;
@@ -47,7 +48,10 @@ async function status(caller: Caller) {
       conversationId: worker.conversationId, sessionId: session?.id ?? null, revivable: worker.revivable,
       pending: worker.pending, awaitingAck: worker.awaitingAck, contextTokens: worker.contextTokens });
   }
-  return { runId: current.runId, freeWorkerSlots: current.freeWorkerSlots, retainedHistory: current.state.retainedHistory === true, workers };
+  return { runId: current.runId, freeWorkerSlots: current.freeWorkerSlots,
+    retainedHistory: current.state.retainedHistory === true, workers,
+    // Owner-scoped native broker statistics; never a provider/ECOM SQL ACK.
+    health: summarizeNativeWorkerHealth(current.state.agents.filter(agent => agent.role === 'worker')) };
 }
 
 /** Reads are owner-scoped broker projections, including parked history. Reports need explicit receipts. */

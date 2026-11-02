@@ -171,6 +171,10 @@ it('lets a local orchestrator spawn real broker workers without a ChatGPT prime 
   expect(result.body.workers).toMatchObject([{ id: 'worker-1', state: 'invited' }]);
   const status = await worker('status', { ownerId, runId: result.body.runId });
   expect(status.body.workers).toMatchObject([{ id: 'worker-1', state: 'invited' }]);
+  expect(status.body.health).toMatchObject({
+    total: 1, invited: 1, active: 0, failed: 0,
+    pendingMessages: 0, awaitingAckMessages: 0, attention: []
+  });
   expect(status.body.freeWorkerSlots).toBe(config.getConfig().multiAgent.maxWorkers - 1);
   expect(broker.primeConversation(result.body.runId)).toBeNull();
 });

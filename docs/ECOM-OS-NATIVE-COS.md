@@ -99,3 +99,31 @@ secure keys, have an explicit executable rollback and independently read back
 the live service. In particular, the CoS native broker and ECOM OS canonical
 supervisor have **different ownership boundaries**: neither may fabricate
 an ACK on the other's behalf.
+
+## Durable engineering checkpoint — 2026-11-02
+
+- **Owner product decision:** start from the real Chat On Steroids app/code,
+  preserve all useful native CoS features and improve the same sub-agent
+  engine. Do not build a look-alike ECOM OS broker.
+- **Source repositories:** upstream is
+  `totec448-spec/chat-on-steroids` (MIT); the existing owner code repository
+  is `evadoumbia07-dot/chat-on-steroids`. Its main branch already contained
+  owner-specific worker admission changes, which this work preserves.
+- **Native patch:** owner-scoped `health` projection on the original CoS
+  Control API; detailed states, pending/ack message counts, owner-native IDs
+  and attention reasons. No new worker identity, queue or scheduler.
+- **Proof:** three focused dependency-free Node 24 unit tests passed.
+  The source's broader Vitest/Electron regression suite has NOT been run
+  in this checkout: dependencies were not installed, and the Windows PC
+  had only about 0.53 GiB available memory during preflight. The GitHub
+  status API returned no checks at the initial readback.
+- **Review artifact:** owner GitHub PR #2,
+  `feat/ecom-cos-native-health-checkpoints-20261102`. Source changes are
+  saved to GitHub, not yet merged or built into the installed application.
+- **Next acceptance:** run full original CoS tests/CI on a capable worker;
+  review and merge the PR, build a separately installable beta that retains
+  the current application/profile, then bind authenticated CoS local owner
+  and native run/worker IDs to an existing canonical ECOM OS UMI. Read back
+  owner-scoped worker state, reconnect after restart, and prove Goal/Loop
+  end to end with genuinely executed agents and independent receipts.
+  No PostgreSQL mission ACK is inferred from a passing source test.

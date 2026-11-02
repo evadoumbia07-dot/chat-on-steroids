@@ -5,6 +5,7 @@ import { noteAgentContextTokens, persistCriticalSwarmNow, stageSpawn, markStaged
 import { logWarn } from './logger.js';
 import { setWorkspaceFor } from './workspace.js';
 import { findSessionByConversation } from './session/store.js';
+import { readSleepingWorkerContexts } from './worker-context-refresh.js';
 import { isGitRepository } from './toolchain.js';
 import { allocWorkerWorkspace, validateWorkerWorkspaceLease, WorkerWorktreeError, type WorkerWorktreeLease, type WorkerWorkspace } from './worktrees/index.js';
 
@@ -22,10 +23,18 @@ import { allocWorkerWorkspace, validateWorkerWorkspaceLease, WorkerWorktreeError
 export async function measureSleepingWorkers(caller: Caller): Promise<void> {
   const state = swarmStateForCaller(caller);
   if (state.agents.length === 0) return;
-  for (const info of state.agents) {
-    if (info.role !== 'worker' || info.state !== 'sleeping' || !info.conversationId) continue;
-    const summary = await findSessionByConversation(info.conversationId, { requireUnique: true }).catch(() => null);
-    if (summary) noteAgentContextTokens(info.conversationId, summary.contextTokens);
+  const sleeping = state.agents.filter(
+    info => info.role === 'worker' && info.state === 'sleeping' && !!info.conversationId
+  );
+  const measurements = await readSleepingWorkerContexts(
+    sleeping.map(info => info.conversationId!),
+    conversationId => findSessionByConversation(conversationId, { requireUnique: true })
+  );
+  // Preserve exact broker order: asynchronous I/O may finish in any order,
+  // but limit/revival changes and the critical persistence barrier do not.
+  for (const [index, info] of sleeping.entries()) {
+    const summary = measurements[index];
+    if (summary) noteAgentContextTokens(info.conversationId!, summary.contextTokens);
   }
   // Measurement is usually telemetry, but crossing the worker ceiling revokes durable revival
   // authority and can terminalize a parked worker. `status` also calls this helper, so there is

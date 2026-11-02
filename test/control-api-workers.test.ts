@@ -171,7 +171,29 @@ it('lets a local orchestrator spawn real broker workers without a ChatGPT prime 
   expect(result.body.workers).toMatchObject([{ id: 'worker-1', state: 'invited' }]);
   const status = await worker('status', { ownerId, runId: result.body.runId });
   expect(status.body.workers).toMatchObject([{ id: 'worker-1', state: 'invited' }]);
+  expect(status.body.nativeBroker).toEqual({
+    source: 'chat-on-steroids-native-broker',
+    localOwnerId: ownerId,
+    runId: result.body.runId,
+    missionAck: false
+  });
+  // A CoS worker status is read-only native attribution, not a fabricated
+  // ECOM OS mission ID, lease owner, reviewer or canonical PostgreSQL ACK.
+  expect(status.body.nativeBroker).not.toHaveProperty('umi');
+  expect(status.body.nativeBroker).not.toHaveProperty('verified');
   expect(status.body.freeWorkerSlots).toBe(config.getConfig().multiAgent.maxWorkers - 1);
+  expect(status.body.nativeSupervision).toEqual({
+    workersTotal: 1,
+    states: { invited: 1 },
+    freeWorkerSlots: config.getConfig().multiAgent.maxWorkers - 1,
+    pendingMessages: 0,
+    unacknowledgedReports: 0,
+    revivableWorkers: 0,
+    source: 'native-owner-scoped-snapshot',
+    missionAck: false
+  });
+  expect(status.body.nativeSupervision).not.toHaveProperty('umi');
+  expect(status.body.nativeSupervision).not.toHaveProperty('ack');
   expect(broker.primeConversation(result.body.runId)).toBeNull();
 });
 
@@ -181,6 +203,12 @@ it('collects exact worker reports across parking, explicitly acknowledges them, 
   broker.finishAgent({ conversationId: 'local-worker-chat' }, 'RESULT: first assignment complete');
   broker.releaseQuiescentRun({ allowPendingReports: true }, spawn.runId);
   const reports = (await worker('reports', { ownerId, runId: spawn.runId })).body;
+  expect(reports.nativeBroker).toEqual({
+    source: 'chat-on-steroids-native-broker',
+    localOwnerId: ownerId,
+    runId: spawn.runId,
+    missionAck: false
+  });
   expect(reports.messages).toMatchObject([{ from: 'worker-1', text: expect.stringContaining('first assignment complete') }]);
   expect((await worker('reports', { ownerId, runId: spawn.runId })).body.messages.map((row: any) => row.id)).toEqual(reports.messages.map((row: any) => row.id));
   expect((await worker('ack', { ownerId, runId: spawn.runId, messageIds: reports.messages.map((row: any) => row.id) })).body.acknowledged).toEqual(reports.messages.map((row: any) => row.id));

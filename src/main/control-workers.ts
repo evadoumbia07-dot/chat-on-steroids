@@ -47,7 +47,48 @@ async function status(caller: Caller) {
       conversationId: worker.conversationId, sessionId: session?.id ?? null, revivable: worker.revivable,
       pending: worker.pending, awaitingAck: worker.awaitingAck, contextTokens: worker.contextTokens });
   }
-  return { runId: current.runId, freeWorkerSlots: current.freeWorkerSlots, retainedHistory: current.state.retainedHistory === true, workers };
+  // The CoS broker owns the worker run. A remote supervisor such as ECOM OS
+  // may bind this *observed* native identity to its own mission registry, but
+  // must not invent the ChatGPT conversation, claim worker ownership, or treat
+  // a CoS result as an independent PostgreSQL mission acknowledgement.
+  return { nativeBroker: nativeBrokerIdentity(caller, current.runId),
+    runId: current.runId, freeWorkerSlots: current.freeWorkerSlots,
+    retainedHistory: current.state.retainedHistory === true,
+    // Derived strictly from this owner-scoped, already authenticated CoS
+    // projection. ECOM OS must not infer external workers or a SQL ACK from it.
+    nativeSupervision: summarizeNativeWorkers(workers, current.freeWorkerSlots),
+    workers };
+}
+
+/** Read-only operational counters; never a second agent registry or broker. */
+function summarizeNativeWorkers(
+  workers: Array<{ state: string; pending: number; awaitingAck: number; revivable: boolean }>,
+  freeWorkerSlots: number
+) {
+  const states: Record<string, number> = Object.create(null);
+  let pendingMessages = 0;
+  let unacknowledgedReports = 0;
+  let revivableWorkers = 0;
+  for (const worker of workers) {
+    states[worker.state] = (states[worker.state] ?? 0) + 1;
+    pendingMessages += worker.pending;
+    unacknowledgedReports += worker.awaitingAck;
+    if (worker.revivable) revivableWorkers++;
+  }
+  return { workersTotal: workers.length, states, freeWorkerSlots,
+    pendingMessages, unacknowledgedReports, revivableWorkers,
+    source: 'native-owner-scoped-snapshot' as const,
+    missionAck: false as const };
+}
+
+/** Stable, authenticated native broker provenance; never an ECOM OS UMI. */
+function nativeBrokerIdentity(caller: Caller, runId: string | null | undefined) {
+  return {
+    source: 'chat-on-steroids-native-broker' as const,
+    localOwnerId: caller.localOwnerId,
+    runId: runId ?? null,
+    missionAck: false as const
+  };
 }
 
 /** Reads are owner-scoped broker projections, including parked history. Reports need explicit receipts. */
@@ -64,9 +105,13 @@ export async function serveWorkerRead(route: string, params: URLSearchParams): P
   if (!result.success) throw new RequestError(400, 'invalid_query');
   const caller = { ...selected.caller, ...result.data };
   if (!selected.action) return status(caller);
-  statusForCaller(caller); // Reject foreign/unknown run selection before any inbox offer.
+  const selectedRun = statusForCaller(caller); // Reject foreign/unknown run selection before any inbox offer.
   const offered = offerMessagesForCaller(caller)?.messages ?? [];
-  return { messages: offered.map(message => ({ id: message.id, runId: message.runId ?? caller.runId ?? null,
+  // A parked family has no active run in the status snapshot, but a
+  // caller-selected runId was already verified above. Preserve that real
+  // identity on report reads instead of silently returning a null runId.
+  return { nativeBroker: nativeBrokerIdentity(caller, selectedRun.runId ?? caller.runId),
+    messages: offered.map(message => ({ id: message.id, runId: message.runId ?? caller.runId ?? null,
     from: message.from, time: message.time, text: redactSecretText(message.text) })) };
 }
 

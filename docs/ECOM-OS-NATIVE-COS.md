@@ -79,6 +79,35 @@ The authenticated Control API integration contract remains covered by
 Vitest dependencies to run. Deploy only after those integrated tests,
 existing native parity tests and a rollback-ready installation pass.
 
+### Read-only local ECOM OS join adapter (source-only until verified)
+
+`scripts/ecom-cos-native-status-readonly.mjs` is an optional **one-shot**
+client for the existing CoS Control API, not another service, scheduler,
+worker or model connector. Run it under the same authorized operating
+system user as CoS with an already verified native `localOwnerId`:
+
+```text
+node scripts/ecom-cos-native-status-readonly.mjs --owner-id VERIFIED_LOWERCASE_UUID
+```
+
+Its only HTTP destination is `127.0.0.1` at the actual CoS endpoint port
+recorded in that user's existing `control-api/endpoint.json`. It reads
+the current token from that user's local profile, never prints the
+token, refuses redirects/invalid ownership or unexpected run IDs,
+and returns only sanitized native IDs/states and
+`canonicalMissionAck:false`. It never returns chat messages, prompts,
+conversation text or provider credentials. If the native Control API is
+not enabled or lacks permission, it fails closed: do not enable it
+silently, bypass it, or guess an owner UUID. The separate ECOM OS
+supervisor alone may bind this observed native identity to an
+existing original UMI after its own authorization/readback.
+
+The adapter's four dependency-free security/functional checks live in
+`test/ecom-cos-native-status-readonly.node.test.mjs`. They use
+synthetic credentials and a fake loopback response, not production
+user data. These tests do **not** demonstrate a real native execution,
+Goal/Loop acceptance, provider QA or independent PostgreSQL ACK.
+
 ## Delivery phases
 
 | Phase | Required proof |

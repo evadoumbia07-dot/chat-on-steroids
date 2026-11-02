@@ -1,0 +1,27 @@
+{
+  "schema": "ECOM_COS_SOURCE_BASELINE_V1",
+  "upstream": {
+    "url": "https://github.com/totec448-spec/chat-on-steroids",
+    "tag": "v2.1.49",
+    "commit": "9413250acc851314da7aa35d4e6745d477bcc8e7",
+    "license": "MIT"
+  },
+  "product": {
+    "name": "ECOM CoS",
+    "basis": "actual-upstream-cos-source",
+    "preserve_original_ui": true,
+    "preserve_original_broker": true,
+    "preserve_goal_loop": true,
+    "preserve_compact_resume": true,
+    "preserve_browser_extension": true,
+    "no_second_orchestrator": true
+  },
+  "integration": {
+    "canonical_mission": "umi-1dad2d3f3ec2246cdc39daa7",
+    "ecom_os_primary": "pulseheberg-vps",
+    "desktop": "existing-windows-cos",
+    "cloud": "fenced-standby",
+    "native_worker_authority": "cos-existing-broker",
+    "business_checkpoint_authority": "ecom-os-existing-postgresql"
+  }
+}

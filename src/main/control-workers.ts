@@ -61,22 +61,29 @@ async function status(caller: Caller) {
 }
 
 /** Read-only operational counters; never a second agent registry or broker. */
-function summarizeNativeWorkers(
-  workers: Array<{ state: string; pending: number; awaitingAck: number; revivable: boolean }>,
+export function summarizeNativeWorkers(
+  workers: Array<{ id: string; state: string; pending: number; awaitingAck: number; revivable: boolean }>,
   freeWorkerSlots: number
 ) {
   const states: Record<string, number> = Object.create(null);
   let pendingMessages = 0;
   let unacknowledgedReports = 0;
   let revivableWorkers = 0;
+  // A projection of the SAME native broker snapshot, never another worker
+  // health registry. Only existing owner-scoped worker IDs leave this route.
+  const attention: Array<{ workerId: string; reasons: Array<'failed' | 'detached' | 'unacknowledged_reports'> }> = [];
   for (const worker of workers) {
     states[worker.state] = (states[worker.state] ?? 0) + 1;
     pendingMessages += worker.pending;
     unacknowledgedReports += worker.awaitingAck;
     if (worker.revivable) revivableWorkers++;
+    const reasons: Array<'failed' | 'detached' | 'unacknowledged_reports'> = [];
+    if (worker.state === 'failed' || worker.state === 'detached') reasons.push(worker.state);
+    if (worker.awaitingAck > 0) reasons.push('unacknowledged_reports');
+    if (reasons.length) attention.push({ workerId: worker.id, reasons });
   }
   return { workersTotal: workers.length, states, freeWorkerSlots,
-    pendingMessages, unacknowledgedReports, revivableWorkers,
+    pendingMessages, unacknowledgedReports, revivableWorkers, attention,
     source: 'native-owner-scoped-snapshot' as const,
     missionAck: false as const };
 }

@@ -26,6 +26,16 @@ scheduler is created by these projections. A parked run may have
 requested and validated archived run retains its original ID on the
 `reports` read. This prevents accidental misattribution during resume.
 
+The same `nativeSupervision` object also provides `attention`: an ordered
+list of **existing owner-scoped native worker IDs** with actual `failed`,
+`detached` or `unacknowledged_reports` reasons in the current broker snapshot.
+An ACK can clear the active snapshot's outstanding count, but parked runs
+retain their separate report history through `/reports?runId=...`; an
+archived report must not be fabricated as an active worker alert. Neither
+operation implies ECOM OS mission verification. ECOM OS can display actionable subagent attention
+without collecting another worker list, leaking conversation content,
+guessing a chat ID, or claiming a PostgreSQL ACK.
+
 **Use case:** ECOM OS can display native worker status and reconcile each
 worker's actual report without guessing a ChatGPT conversation ID or
 claiming that a green CoS agent implies an independently verified mission.

@@ -189,6 +189,7 @@ it('lets a local orchestrator spawn real broker workers without a ChatGPT prime 
     pendingMessages: 0,
     unacknowledgedReports: 0,
     revivableWorkers: 0,
+    attention: [],
     source: 'native-owner-scoped-snapshot',
     missionAck: false
   });
@@ -213,6 +214,7 @@ it('collects exact worker reports across parking, explicitly acknowledges them, 
   expect((await worker('reports', { ownerId, runId: spawn.runId })).body.messages.map((row: any) => row.id)).toEqual(reports.messages.map((row: any) => row.id));
   expect((await worker('ack', { ownerId, runId: spawn.runId, messageIds: reports.messages.map((row: any) => row.id) })).body.acknowledged).toEqual(reports.messages.map((row: any) => row.id));
   expect((await worker('reports', { ownerId, runId: spawn.runId })).body.messages).toEqual([]);
+  expect((await worker('status', { ownerId, runId: spawn.runId })).body.nativeSupervision.attention).toEqual([]);
   const wake = await worker('message', { ownerId, runId: spawn.runId, messages: [{ to: 'worker-1', text: 'Second assignment.', label: 'Follow-up' }] });
   expect(wake.status, JSON.stringify(wake.body)).toBe(202);
   expect(wake.body.waking).toEqual(['worker-1']);

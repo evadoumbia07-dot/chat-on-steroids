@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { summarizeNativeWorkerHealth } from '../src/shared/native-worker-health.ts';
 
@@ -40,4 +41,13 @@ test('invalid or negative message counts do not corrupt the health summary', () 
   assert.equal(health.pendingMessages, 0);
   assert.equal(health.awaitingAckMessages, 0);
   assert.deepEqual(health.attention, []);
+});
+
+test('the native status API computes health only from the authenticated owner family', () => {
+  const source = readFileSync(new URL('../src/main/control-workers.ts', import.meta.url), 'utf8');
+  assert.match(source, /const current = statusForCaller\(caller\)/);
+  assert.match(source, /health: summarizeNativeWorkerHealth\(current\.state\.agents\.filter\(agent => agent\.role === 'worker'\)\)/);
+  assert.doesNotMatch(source, /summarizeNativeWorkerHealth\(swarmState\(/);
+  assert.match(source, /const selected = callerFor\(route\)/);
+  assert.match(source, /const caller = \{ \.\.\.selected\.caller, \.\.\.result\.data \}/);
 });

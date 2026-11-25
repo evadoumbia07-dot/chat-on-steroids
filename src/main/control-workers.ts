@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { workerBrowserDelivery } from './bridge.js';
 import { localOwnerFamilyDirectory, acknowledgeLocalReports, offerMessagesForCaller, persistCriticalSwarmNow, requestWorkerBootstraps,
   requestWorkerRevivals, stageMessages, statusForCaller, type Caller } from './agents.js';
 import { acceptAgentMutation, measureSleepingWorkers, spawnAgentWorkers } from './agent-admission.js';
@@ -49,6 +50,7 @@ async function status(caller: Caller) {
   const current = statusForCaller(caller);
   const familyDirectory = localOwnerFamilyDirectory(caller);
   const selected = familyDirectory.families.find(family => family.familyId === familyDirectory.selectedFamilyId);
+  const browserDelivery = workerBrowserDelivery(current.runId, current.state.agents.filter(agent => agent.role === 'worker'));
   const workers = [];
   for (const worker of current.state.agents.filter(agent => agent.role === 'worker')) {
     const session = worker.conversationId ? await findSessionByConversation(worker.conversationId, { requireUnique: true }) : null;
@@ -66,6 +68,7 @@ async function status(caller: Caller) {
   // must survive a restart so the supervisor can reconcile without spawning.
   return { nativeBroker: nativeBrokerIdentity(caller, current.runId ?? caller.runId ?? selected?.runId),
     familyDirectory,
+    browserDelivery,
     runId: current.runId, freeWorkerSlots: current.freeWorkerSlots,
     admissibleWorkerSlots: current.admissibleWorkerSlots,
     retainedHistory: current.state.retainedHistory === true,

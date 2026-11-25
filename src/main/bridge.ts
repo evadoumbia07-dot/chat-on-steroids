@@ -31,6 +31,7 @@ import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, coll
 import { callHoldOpen, holdCalls } from './rotation-hold.js';
 import { authorizedPluginRefreshPublications, hasRequestedPluginRefresh, pendingPluginRefreshes, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh } from './plugin-refresh.js';
 import { attachBrowserWake, wakeActivityWork, wakeBrowserWork } from './browser-wake.js';
+import { nativeBrowserDelivery, type BrowserCommandObservation } from './native-browser-delivery.js';
 import { noteRouteExistingChatSend, tunnelRouteSettling } from './tunnel/route-settle.js';
 import { noteChatgptProjects } from './chatgpt-project-catalog.js';
 import { armProjectCreate, bindChatToLinkedProject, claimProjectCreate, completeProjectCreate, failProjectCreate, getProject, markProjectGone, pendingProjectCreates } from './projects.js';
@@ -13057,6 +13058,23 @@ export function cancelWorkerCommands(reason: string, agent?: string, runId?: str
   // documents that its callers are already in one; the next poll picks up whatever was
   // queued behind the cancelled command.
   return doomed.length;
+}
+
+/** Native owner-scoped diagnostics; callers must first prove the selected broker run.
+ * No task text, chat identifier, URL, command ID, raw error, token or foreign run leaves here.
+ * An observed queue/claim is not evidence of a delivered prompt or completed task.
+ */
+export function workerBrowserDelivery(runId: string | null, workers: readonly { id: string; state: string }[]) {
+  const observations: BrowserCommandObservation[] = [];
+  for (const command of commands) {
+    const spec = command.spec;
+    if (!runId || (spec.type !== 'worker' && spec.type !== 'revive') || spec.runId !== runId) continue;
+    observations.push({ runId: spec.runId, workerId: spec.agent, kind: spec.type,
+      claimed: command.claimedAt !== null, held: Boolean(command.sendCheck && !command.sendCheck.allowed),
+      hasError: command.lastError !== null });
+  }
+  return nativeBrowserDelivery({ runId, workers, bridgeRunning: server !== null,
+    recentBrowser: browserPresent(), wakeConnected: browserWakeConnected(), commands: observations });
 }
 
 /** What the UI shows about work waiting on the browser. */

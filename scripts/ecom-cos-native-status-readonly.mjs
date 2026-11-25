@@ -38,6 +38,25 @@ function familyDirectory(raw, selectedRun, expectedRunId) {
   return { selectedFamilyId: d.selectedFamilyId, selectionRequired: d.selectionRequired, families };
 }
 
+/** Only a verified current-run queue projection may enter the controller receipt. */
+function browserDelivery(raw, workers) {
+  if (raw.browserDelivery === undefined) return null;
+  const b = raw.browserDelivery;
+  const invalid = () => { throw Error('COS_NATIVE_BROWSER_DELIVERY_INVALID'); };
+  if (!b || b.source !== 'native-bridge-queue' || b.missionAck !== false ||
+      b.runId !== raw.runId || !['bridge_stopped','wake_connected','recent_http_only','browser_unseen'].includes(b.reachability) ||
+      !Array.isArray(b.workers) || b.workers.length > workers.length) invalid();
+  const pending = new Set(workers.filter(w => w.state === 'invited' || w.state === 'waking').map(w => w.id));
+  const rows = b.workers.map(w => {
+    if (!w || !pending.delete(w.workerId) || typeof w.hasError !== 'boolean' ||
+        !['not_observed','queued','claimed','send_held','ambiguous'].includes(w.delivery) ||
+        (raw.runId === null && w.delivery !== 'not_observed')) invalid();
+    return { workerId: w.workerId, delivery: w.delivery, hasError: w.hasError };
+  });
+  if (pending.size) invalid();
+  return { source: b.source, runId: b.runId, reachability: b.reachability, workers: rows, missionAck: false };
+}
+
 /**
  * One authenticated, owner-scoped READ from the existing CoS Control API.
  * This adapter is a short-lived client, not a scheduler, worker or broker.
@@ -125,6 +144,7 @@ export async function readNativeCosOwnerStatus({
       awaitingAck: safeCount(worker.awaitingAck)
     };
   });
+  const browser = browserDelivery(raw, workers);
   return {
     schema: 'ECOM_COS_NATIVE_OWNER_STATUS_READONLY_V1',
     source: 'authenticated-original-cos-control-api',
@@ -132,6 +152,7 @@ export async function readNativeCosOwnerStatus({
     runId: selectedRun,
     activeRunId: raw.runId,
     ...(directory ? { familyDirectory: directory } : {}),
+    ...(browser ? { browserDelivery: browser } : {}),
     retainedHistory: raw.retainedHistory === true,
     freeWorkerSlots: safeCount(raw.freeWorkerSlots),
     workers,

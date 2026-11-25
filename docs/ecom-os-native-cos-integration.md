@@ -89,3 +89,15 @@ No cross-owner adoption, guessed chat, extra queue or scheduler is allowed.
 Browser-backed workers still need their authorized provider browser
 session; this changes the prime's control identity, not the model provider.
 A non-browser worker must use a separately authorized existing executor.
+
+## Browser delivery diagnostics
+
+The same authenticated worker status now includes browserDelivery, sampled
+from the existing native bridge queue. It separates bridge stopped,
+recent HTTP presence, authenticated wake connection and browser unseen.
+For invited/waking workers it distinguishes not observed, queued,
+claimed, send held and ambiguous commands using the exact current run
+incarnation plus worker ID and command kind. Raw command text, URL,
+error, tokens and foreign run data are not returned. These are observation
+states, not delivery receipts or permission to retry an uncertain send.
+No additional Chrome instance, Playwright worker or scheduler is started.

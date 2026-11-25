@@ -151,3 +151,17 @@ test('rejects contradictory family proof and a different stable address', async 
       families: [{familyId: another, runId: another, running: true}]}});
   await assert.rejects(readNativeCosOwnerStatus(wrong.options), /COS_NATIVE_RUN_MISMATCH/);
 });
+
+test('retains only owner-scoped queue diagnostics and rejects a stale or foreign command', async () => {
+  const raw = {nativeBroker: proof, runId: run, workers: [{id:'worker-1',state:'invited',runId:run}],
+    browserDelivery:{source:'native-bridge-queue',runId:run,reachability:'wake_connected',
+      workers:[{workerId:'worker-1',delivery:'claimed',hasError:false, rawError:'PRIVATE'}],missionAck:false}};
+  const result = await readNativeCosOwnerStatus(options(raw).options);
+  assert.equal(result.browserDelivery.workers[0].delivery,'claimed');
+  assert.equal(result.browserDelivery.missionAck,false);
+  assert.ok(!JSON.stringify(result).includes('PRIVATE'));
+  await assert.rejects(readNativeCosOwnerStatus(options({...raw,browserDelivery:{...raw.browserDelivery,
+    workers:[{workerId:'worker-2',delivery:'queued',hasError:false}]}}).options),/COS_NATIVE_BROWSER_DELIVERY_INVALID/);
+  await assert.rejects(readNativeCosOwnerStatus(options({...raw,browserDelivery:{...raw.browserDelivery,
+    runId:'33333333-3333-4333-8333-333333333333'}}).options),/COS_NATIVE_BROWSER_DELIVERY_INVALID/);
+});

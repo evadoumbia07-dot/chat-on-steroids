@@ -31,7 +31,7 @@ import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, coll
 import { callHoldOpen, holdCalls } from './rotation-hold.js';
 import { authorizedPluginRefreshPublications, hasRequestedPluginRefresh, pendingPluginRefreshes, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh } from './plugin-refresh.js';
 import { attachBrowserWake, wakeActivityWork, wakeBrowserWork } from './browser-wake.js';
-import { nativeBrowserDelivery, type BrowserCommandObservation } from './native-browser-delivery.js';
+import { nativeBrowserDelivery, nativeBrowserLaunchPending, nativeReconnectNeedsDelivery, type BrowserCommandObservation } from './native-browser-delivery.js';
 import { noteRouteExistingChatSend, tunnelRouteSettling } from './tunnel/route-settle.js';
 import { noteChatgptProjects } from './chatgpt-project-catalog.js';
 import { armProjectCreate, bindChatToLinkedProject, claimProjectCreate, completeProjectCreate, failProjectCreate, getProject, markProjectGone, pendingProjectCreates } from './projects.js';
@@ -6874,7 +6874,21 @@ function attachBridgeWake(instance: http.Server): void {
     async candidate => {
       const stored = await getSecret('bridgeToken');
       return !!stored && stored !== BROWSER_DISCONNECTED && safeEqual(candidate, stored);
-    }, changed);
+    }, () => {
+      changed();
+      // A companion can reconnect without any ChatGPT tab. Its authenticated wake
+      // channel is sufficient to end the cold-launch wait. Never reset a spent lease
+      // or reopen a claimed command: the ordinary durable delivery pump owns admission.
+      if (server !== instance || !nativeReconnectNeedsDelivery({
+        running: bridgeDesiredRunning && !bridgeShutdownRequested,
+        recovering: bridgeRecovering,
+        wakeConnected: browserWakeConnected(),
+        commands: commands.map(c => ({ kind: c.spec.type, claimedAt: c.claimedAt }))
+      })) return;
+      if (browserLaunchTimer) clearTimeout(browserLaunchTimer);
+      browserLaunchTimer = null;
+      scheduleDeliver();
+    });
 }
 
 /** Called inside the serialized config transaction, with its validated latest proposal. */
@@ -7872,7 +7886,9 @@ let browserLaunchTimer: NodeJS.Timeout | null = null;
  * not a launch anybody is waiting on, whether or not it is the one that was started.
  */
 function browserLaunchPending(now = Date.now()): boolean {
-  return !browserPresent() && now < lastBrowserLaunchAt + BROWSER_LAUNCH_GRACE_MS;
+  return nativeBrowserLaunchPending({ recentBrowser: browserPresent(),
+    wakeConnected: browserWakeConnected(), lastLaunchAt: lastBrowserLaunchAt,
+    now, graceMs: BROWSER_LAUNCH_GRACE_MS });
 }
 
 /** Re-runs delivery once the pending launch's window closes, so nothing waits on a lost one. */

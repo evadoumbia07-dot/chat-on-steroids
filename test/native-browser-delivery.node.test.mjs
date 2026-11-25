@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { nativeBrowserDelivery } from '../src/main/native-browser-delivery.ts';
+import { nativeBrowserDelivery, nativeBrowserLaunchPending, nativeReconnectNeedsDelivery } from '../src/main/native-browser-delivery.ts';
 const worker = { id: 'worker-1', state: 'invited' };
 const base = { runId: 'run-a', workers: [worker], bridgeRunning: true,
   recentBrowser: false, wakeConnected: false, commands: [] };
@@ -33,4 +33,22 @@ test('only pending workers are projected and parked runs never adopt a command',
   const x = nativeBrowserDelivery({...base, workers: [{id:'worker-1',state:'waking'}, {id:'worker-2',state:'active'}],
     runId: null, commands: [{...cmd, kind:'revive'}]});
   assert.deepEqual(x.workers, [{workerId:'worker-1',delivery:'not_observed',hasError:false}]);
+});
+
+test('authenticated wake ends cold launch wait without a ChatGPT HTTP sighting', () => {
+  const launch = { recentBrowser: false, wakeConnected: false, lastLaunchAt: 1000, now: 2000, graceMs: 60000 };
+  assert.equal(nativeBrowserLaunchPending(launch), true);
+  assert.equal(nativeBrowserLaunchPending({...launch,wakeConnected:true}), false);
+  assert.equal(nativeBrowserLaunchPending({...launch,recentBrowser:true}), false);
+  assert.equal(nativeBrowserLaunchPending({...launch,now:61000}), false);
+  assert.equal(nativeBrowserLaunchPending({...launch,lastLaunchAt:0}), false);
+});
+test('reconnect wakes only unleased fresh work and respects stopped/recovering bridge', () => {
+  const pending = {running:true,recovering:false,wakeConnected:true,commands:[{kind:'worker',claimedAt:null}]};
+  assert.equal(nativeReconnectNeedsDelivery(pending), true);
+  assert.equal(nativeReconnectNeedsDelivery({...pending,commands:[{kind:'resume',claimedAt:null}]}), true);
+  for (const change of [{running:false},{recovering:true},{wakeConnected:false},
+    {commands:[]},{commands:[{kind:'worker',claimedAt:123}]},{commands:[{kind:'revive',claimedAt:null}]}]) {
+    assert.equal(nativeReconnectNeedsDelivery({...pending,...change}), false);
+  }
 });

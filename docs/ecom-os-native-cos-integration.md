@@ -101,3 +101,9 @@ incarnation plus worker ID and command kind. Raw command text, URL,
 error, tokens and foreign run data are not returned. These are observation
 states, not delivery receipts or permission to retry an uncertain send.
 No additional Chrome instance, Playwright worker or scheduler is started.
+
+An authenticated wake connection also ends the existing cold browser launch
+grace, even with no ChatGPT HTTP activity. Reconnection asks the same
+coalesced delivery pump to inspect unleased fresh commands. It never clears
+a durable opening lease, retries a claimed send or creates another queue.
+The existing lifecycle and recovery fences remain in force.

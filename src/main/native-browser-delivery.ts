@@ -35,3 +35,23 @@ export function nativeBrowserDelivery(input: {
     missionAck: false as const
   };
 }
+
+/** An authenticated idle extension is just as reachable as a recent HTTP request.
+ * A launch window never forces a connected browser to wait for a ChatGPT page.
+ */
+export function nativeBrowserLaunchPending(input: {
+  recentBrowser: boolean; wakeConnected: boolean;
+  lastLaunchAt: number; now: number; graceMs: number;
+}): boolean {
+  return !input.recentBrowser && !input.wakeConnected &&
+    input.lastLaunchAt > 0 && input.now < input.lastLaunchAt + input.graceMs;
+}
+
+/** Only work with no opening lease may be considered by the existing delivery pump. */
+export function nativeReconnectNeedsDelivery(input: {
+  running: boolean; recovering: boolean; wakeConnected: boolean;
+  commands: readonly { kind: string; claimedAt: number | null }[];
+}): boolean {
+  return input.running && !input.recovering && input.wakeConnected &&
+    input.commands.some(c => c.claimedAt === null && (c.kind === 'worker' || c.kind === 'resume'));
+}

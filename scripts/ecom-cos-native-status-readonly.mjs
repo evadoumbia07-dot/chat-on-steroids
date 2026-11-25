@@ -10,6 +10,34 @@ const safeCount = value => Number.isSafeInteger(value) && value >= 0 ? value : 0
 const optionalId = value => typeof value === 'string' && value.length <= 128
   && /^[a-zA-Z0-9_-]+$/.test(value) ? value : null;
 
+/** Validate the existing broker's family projection; never infer a family from a chat. */
+function familyDirectory(raw, selectedRun, expectedRunId) {
+  if (raw.familyDirectory === undefined) return null;
+  const d = raw.familyDirectory;
+  const invalid = () => { throw Error('COS_NATIVE_FAMILY_DIRECTORY_INVALID'); };
+  if (!d || !Array.isArray(d.families) || d.families.length > 200 ||
+      typeof d.selectionRequired !== 'boolean' ||
+      (d.selectedFamilyId !== null && !UUID.test(d.selectedFamilyId ?? ''))) invalid();
+  const seen = new Set(), runs = new Set();
+  const families = d.families.map(f => {
+    if (!f || !UUID.test(f.familyId ?? '') || !UUID.test(f.runId ?? '') ||
+        typeof f.running !== 'boolean' || seen.has(f.familyId) || runs.has(f.runId)) invalid();
+    seen.add(f.familyId); runs.add(f.runId);
+    return { familyId: f.familyId, runId: f.runId, running: f.running };
+  });
+  const selected = families.find(f => f.familyId === d.selectedFamilyId);
+  if (d.selectedFamilyId !== null && !selected) invalid();
+  if (d.selectionRequired !== (!expectedRunId && families.length > 1) ||
+      (d.selectionRequired && selected) ||
+      (!d.selectionRequired && families.length > 0 && !selected) ||
+      (!selected && (selectedRun !== null || raw.runId !== null || raw.workers.length > 0))) invalid();
+  if (selected && (selected.running !== (raw.runId !== null) ||
+      (selected.running && selected.runId !== raw.runId) ||
+      (!selected.running && selectedRun !== selected.runId && selectedRun !== expectedRunId))) invalid();
+  if (expectedRunId && !selected) invalid();
+  return { selectedFamilyId: d.selectedFamilyId, selectionRequired: d.selectionRequired, families };
+}
+
 /**
  * One authenticated, owner-scoped READ from the existing CoS Control API.
  * This adapter is a short-lived client, not a scheduler, worker or broker.
@@ -80,7 +108,9 @@ export async function readNativeCosOwnerStatus({
     || (raw.runId !== null && selectedRun !== raw.runId)
     || (raw.runId === null && selectedRun !== null && raw.retainedHistory !== true))
     throw Error('COS_NATIVE_BROKER_PROOF_INVALID');
-  if (expectedRunId !== undefined && selectedRun !== expectedRunId)
+  const directory = familyDirectory(raw, selectedRun, expectedRunId);
+  if (expectedRunId !== undefined && selectedRun !== expectedRunId &&
+      directory?.selectedFamilyId !== expectedRunId)
     throw Error('COS_NATIVE_RUN_MISMATCH');
   const workers = raw.workers.map(worker => {
     if (!WORKER_ID.test(worker?.id ?? '') || !STATES.has(worker?.state))
@@ -101,6 +131,7 @@ export async function readNativeCosOwnerStatus({
     localOwnerId,
     runId: selectedRun,
     activeRunId: raw.runId,
+    ...(directory ? { familyDirectory: directory } : {}),
     retainedHistory: raw.retainedHistory === true,
     freeWorkerSlots: safeCount(raw.freeWorkerSlots),
     workers,

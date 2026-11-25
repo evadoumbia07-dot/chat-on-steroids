@@ -114,3 +114,40 @@ test('retains the verified parked identity without inventing an active run', asy
   const invalid = options({ runId: null, retainedHistory: false, nativeBroker: proof, workers: [] });
   await assert.rejects(readNativeCosOwnerStatus(invalid.options), /COS_NATIVE_BROKER_PROOF_INVALID/);
 });
+
+test('follows the original stable family address when an incarnation rotates', async () => {
+  const active = '33333333-3333-4333-8333-333333333333';
+  const { options: o } = options({runId: active, retainedHistory: false,
+    nativeBroker: {...proof, runId: active}, workers: [],
+    familyDirectory: {selectedFamilyId: run, selectionRequired: false,
+      families: [{familyId: run, runId: active, running: true}]}});
+  const receipt = await readNativeCosOwnerStatus(o);
+  assert.equal(receipt.activeRunId, active);
+  assert.equal(receipt.familyDirectory.selectedFamilyId, run);
+  assert.equal(receipt.canonicalMissionAck, false);
+});
+
+test('returns owner-scoped discovery instead of claiming an ambiguous family', async () => {
+  const another = '33333333-3333-4333-8333-333333333333';
+  const { options: o } = options({runId: null, nativeBroker: {...proof, runId: null}, workers: [],
+    familyDirectory: {selectedFamilyId: null, selectionRequired: true,
+      families: [{familyId: run, runId: run, running: true},
+        {familyId: another, runId: another, running: false}]}});
+  delete o.expectedRunId;
+  const receipt = await readNativeCosOwnerStatus(o);
+  assert.equal(receipt.familyDirectory.selectionRequired, true);
+  assert.equal(receipt.familyDirectory.families.length, 2);
+  assert.equal(receipt.runId, null);
+});
+
+test('rejects contradictory family proof and a different stable address', async () => {
+  const another = '33333333-3333-4333-8333-333333333333';
+  const { options: o } = options({runId: another, nativeBroker: {...proof, runId: another}, workers: [],
+    familyDirectory: {selectedFamilyId: run, selectionRequired: false,
+      families: [{familyId: run, runId: another, running: false}]}});
+  await assert.rejects(readNativeCosOwnerStatus(o), /COS_NATIVE_FAMILY_DIRECTORY_INVALID/);
+  const wrong = options({runId: another, nativeBroker: {...proof, runId: another}, workers: [],
+    familyDirectory: {selectedFamilyId: another, selectionRequired: false,
+      families: [{familyId: another, runId: another, running: true}]}});
+  await assert.rejects(readNativeCosOwnerStatus(wrong.options), /COS_NATIVE_RUN_MISMATCH/);
+});

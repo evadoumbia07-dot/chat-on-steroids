@@ -1039,6 +1039,28 @@ export function agentFamiliesForCaller(input: Caller): Array<{ run_id: string; r
   return familiesForCaller(input).map(owner => ({ run_id: familyKey(owner), running: 'runId' in owner }));
 }
 
+/** Stable owner-scoped addresses for the existing authenticated local control API.
+ * The first incarnation stays addressable across wakes and persisted broker restores.
+ * No conversation ID, request ID, new ownership claim or separate registry is needed.
+ */
+export function localOwnerFamilyDirectory(input: Caller) {
+  const caller = exactCaller(input);
+  requireEnabled();
+  if (!caller.localOwnerId || !hasCallerIdentity(caller)) throw new IdentityLostError();
+  requireMatchingSetupProfile(caller);
+  const selected = selectedFamily(caller);
+  if (caller.runId && !selected) throw busyFor(caller);
+  return {
+    selectedFamilyId: selected ? familyReplyAddress(selected) : null,
+    selectionRequired: !caller.runId && familiesForCaller(caller).length > 1,
+    families: familiesForCaller(caller).map(owner => ({
+      familyId: familyReplyAddress(owner),
+      runId: familyKey(owner),
+      running: 'runId' in owner
+    }))
+  };
+}
+
 function requireEnabled(): void {
   if (!getConfig().multiAgent.enabled) {
     throw new AgentError('Multi-agent mode is switched off in Chat On Steroids. Ask the user to enable it.');

@@ -238,6 +238,35 @@ it('retains local ownership and unread reports through a broker restart', async 
   expect((await worker('reports', { ownerId, runId: spawn.runId })).body.messages).toMatchObject([{ from: 'worker-1', text: expect.stringContaining('retained report') }]);
 });
 
+it('rediscovers the same local family without a prime chat after parking, restart and wake', async () => {
+  const first = (await worker('spawn', { ownerId, workers: [{ task: 'Inspect.' }] })).body;
+  const foreignOwner = '33333333-3333-4333-8333-333333333333';
+  const foreign = (await worker('spawn', { ownerId: foreignOwner, workers: [{ task: 'Other owner.' }] })).body;
+  broker.bindConversation('worker-1', 'stable-family-worker', first.runId);
+  broker.finishAgent({ conversationId: 'stable-family-worker' }, 'RESULT: retained');
+  broker.releaseQuiescentRun({ allowPendingReports: true }, first.runId);
+  const snapshot = broker.snapshotSwarm();
+  broker.resetAgentsForTests();
+  broker.restoreSwarm(snapshot);
+  broker.onSwarmPersistNow(state => durable.writeDurableNow('swarm', state));
+  const parked = (await worker('status', { ownerId })).body;
+  expect(parked.familyDirectory).toEqual({
+    selectedFamilyId: first.runId, selectionRequired: false,
+    families: [{ familyId: first.runId, runId: first.runId, running: false }]
+  });
+  expect(parked.nativeBroker.runId).toBe(first.runId);
+  const wake = await worker('message', { ownerId, runId: first.runId, messages: [{ to: 'worker-1', text: 'Resume.' }] });
+  expect(wake.status).toBe(202);
+  expect(wake.body.runId).not.toBe(first.runId);
+  const resumed = (await worker('status', { ownerId, runId: first.runId })).body;
+  expect(resumed.familyDirectory).toEqual({
+    selectedFamilyId: first.runId, selectionRequired: false,
+    families: [{ familyId: first.runId, runId: wake.body.runId, running: true }]
+  });
+  expect(resumed.nativeBroker.runId).toBe(wake.body.runId);
+  expect((await worker('status', { ownerId, runId: foreign.runId })).status).toBe(500);
+});
+
 it('does not reoffer successfully acknowledged reports after loading the durable broker snapshot', async () => {
   const spawn = (await worker('spawn', { ownerId, workers: [{ task: 'Complete a task.' }] })).body;
   broker.bindConversation('worker-1', 'acked-worker', spawn.runId);

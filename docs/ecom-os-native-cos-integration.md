@@ -74,3 +74,18 @@ replacement lease is a refusal, not an authorization to reuse a staged
 worker. The trusted host must supply the real normalized lease and revision
 identifiers; no fallback or fabricated identifiers are permitted. This is a
 source-level gate, not evidence that a production host is wired to it.
+
+## Durable local family address (without a ChatGPT prime)
+
+The existing loopback Control API accepts the locally authenticated
+controller's native owner UUID, not a browser conversation ID. Its status
+now exposes an owner-scoped familyDirectory with the original stable
+familyId, current incarnation runId, running state and explicit selection
+requirement. It derives these values from the native broker's existing
+persisted aliases. The read-only client verifies the selected family
+before following a rotated incarnation. The host must retain its real
+authorized owner ID and family address in the canonical controller.
+No cross-owner adoption, guessed chat, extra queue or scheduler is allowed.
+Browser-backed workers still need their authorized provider browser
+session; this changes the prime's control identity, not the model provider.
+A non-browser worker must use a separately authorized existing executor.

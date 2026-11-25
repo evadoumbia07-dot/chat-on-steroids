@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { acknowledgeLocalReports, offerMessagesForCaller, persistCriticalSwarmNow, requestWorkerBootstraps,
+import { localOwnerFamilyDirectory, acknowledgeLocalReports, offerMessagesForCaller, persistCriticalSwarmNow, requestWorkerBootstraps,
   requestWorkerRevivals, stageMessages, statusForCaller, type Caller } from './agents.js';
 import { acceptAgentMutation, measureSleepingWorkers, spawnAgentWorkers } from './agent-admission.js';
 import { effectiveCapabilities, getConfig } from './config.js';
@@ -47,6 +47,8 @@ async function status(caller: Caller) {
   await measureSleepingWorkers(caller);
   assertReadProfile(caller);
   const current = statusForCaller(caller);
+  const familyDirectory = localOwnerFamilyDirectory(caller);
+  const selected = familyDirectory.families.find(family => family.familyId === familyDirectory.selectedFamilyId);
   const workers = [];
   for (const worker of current.state.agents.filter(agent => agent.role === 'worker')) {
     const session = worker.conversationId ? await findSessionByConversation(worker.conversationId, { requireUnique: true }) : null;
@@ -62,7 +64,8 @@ async function status(caller: Caller) {
   // statusForCaller has already verified the caller-selected run. A parked
   // family has no active incarnation, but the selected historical identity
   // must survive a restart so the supervisor can reconcile without spawning.
-  return { nativeBroker: nativeBrokerIdentity(caller, current.runId ?? caller.runId),
+  return { nativeBroker: nativeBrokerIdentity(caller, current.runId ?? caller.runId ?? selected?.runId),
+    familyDirectory,
     runId: current.runId, freeWorkerSlots: current.freeWorkerSlots,
     admissibleWorkerSlots: current.admissibleWorkerSlots,
     retainedHistory: current.state.retainedHistory === true,

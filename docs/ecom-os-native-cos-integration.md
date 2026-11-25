@@ -1,6 +1,6 @@
 # Original Chat On Steroids → ECOM OS: native broker continuity
 
-This work modifies **the actual Chat On Steroids 2.1.49 source tree**, not
+This work modifies **the actual Chat On Steroids source tree (v2.1.55 candidate)**, not
 an independently reimplemented CoS clone. The original Electron user
 interface, chat sessions, Goal/Loop control, agent lifecycle, model adapters,
 browser tools and worker Git worktree isolation remain the foundation.
@@ -23,8 +23,8 @@ free family slots, pending messages, reports awaiting acknowledgment and
 revivable workers. No new registry, lease, worker, PostgreSQL writer or
 scheduler is created by these projections. A parked run may have
 `runId: null` in its current active-state view, while a specifically
-requested and validated archived run retains its original ID on the
-`reports` read. This prevents accidental misattribution during resume.
+requested and validated archived run retains its original ID in
+`nativeBroker` on status and report reads. This prevents accidental misattribution during resume.
 
 The same `nativeSupervision` object also provides `attention`: an ordered
 list of **existing owner-scoped native worker IDs** with actual `failed`,
@@ -55,11 +55,22 @@ claiming that a green CoS agent implies an independently verified mission.
    pause/resume/stop and restoration after a controlled restart before
    advertising these behaviors as fully operational in ECOM OS.
 6. PulseHeberg remains the primary ECOM OS control plane. The PC is an
-   optional registered worker. Google Cloud stays standby/fenced until a
-   verified failover, never a second simultaneous PostgreSQL writer.
+   optional registered worker. Google Cloud is stopped and excluded from this deployment.
 
 Current source changes are **not a production CoS release**. A green native
 unit test is a source-level checkpoint, not proof that the Windows or VPS
 installed app has the enhanced counters, that a model account can run
 unrestricted agents, or that the original ECOM mission received its
 independent PostgreSQL ACK.
+
+## Transaction identity continuity
+
+The existing ECOM admission adapter pins the mission ID, actual canonical
+lease ID and canonical revision at the first successful check of one
+admission transaction. Both later asynchronous and synchronous barriers must
+return the exact same tuple as well as pass the existing authorization,
+fencing, capacity and reconciliation checks. A different valid mission or
+replacement lease is a refusal, not an authorization to reuse a staged
+worker. The trusted host must supply the real normalized lease and revision
+identifiers; no fallback or fabricated identifiers are permitted. This is a
+source-level gate, not evidence that a production host is wired to it.

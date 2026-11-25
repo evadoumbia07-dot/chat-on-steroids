@@ -120,3 +120,14 @@ workers are killed or paused. The configured family/global caps and
 provider limits still apply. Controller reads include admissibleWorkerSlots
 when present, distinct from family freeWorkerSlots. This is host-local, not
 a remote-host selection policy; enable only after isolated acceptance.
+
+## Optional CPU pressure guard
+
+hostCpuGuard is separately opt-in and off by default. Effective processor
+parallelism is used instead of advertised host core count. Unix uses
+one-minute system load, Windows uses recent CPU counter deltas (the first
+sample cannot grant admission). The estimate keeps 20% CPU headroom and
+reserves half a core per pending/new worker. System-wide load can be
+conservative for constrained workers. The lower of CPU and RAM headroom
+wins, without overriding configured limits or provider quotas. This is an
+admission guard only, not process throttling or PC/VPS dispatch.

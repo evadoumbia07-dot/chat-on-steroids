@@ -1,4 +1,4 @@
-import { freemem, totalmem } from 'node:os';
+import { availableParallelism, cpus, freemem, loadavg, totalmem } from 'node:os';
 import { readFileSync } from 'node:fs';
 
 const MiB = 1024 * 1024;
@@ -38,5 +38,60 @@ export function hostMemoryAdmissionSlots(enabled: boolean, pendingWorkers: numbe
     }
     return memoryAdmissionSlots({ enabled, availableMiB: available / MiB,
       totalMiB: total / MiB, pendingWorkers });
+  } catch { return 0; }
+}
+
+/** Conservative local CPU admission estimate. Load is expressed in busy-core equivalents.
+ * A missing sample is not proof of capacity. This is not a CPU quota for running agents.
+ */
+export function cpuAdmissionSlots(input: {
+  enabled: boolean; parallelism: number; load: number; pendingWorkers: number;
+}): number {
+  if (!input.enabled) return Infinity;
+  if (!Number.isSafeInteger(input.parallelism) || input.parallelism < 1 ||
+      !Number.isFinite(input.load) || input.load < 0 ||
+      !Number.isSafeInteger(input.pendingWorkers) || input.pendingWorkers < 0) return 0;
+  return Math.max(0, Math.floor((input.parallelism * 0.8 - input.load) / 0.5) - input.pendingWorkers);
+}
+
+type CpuTicks = { at: number; total: number; idle: number; cores: number };
+let previousTicks: CpuTicks | undefined;
+let lastCpuLoad: number | undefined;
+
+/** Windows does not provide loadavg. Use deltas of OS CPU counters, never a blocking sleep.
+ * On restricted hosts the system-wide load may overestimate our share: fail conservatively.
+ */
+export function cpuLoadFromTicks(before: CpuTicks, after: CpuTicks): number | undefined {
+  const elapsed = after.at - before.at;
+  const total = after.total - before.total;
+  const idle = after.idle - before.idle;
+  if (elapsed < 1000 || elapsed > 30000 || before.cores !== after.cores ||
+      !Number.isFinite(total) || !Number.isFinite(idle) ||
+      total <= 0 || idle < 0 || idle > total) return undefined;
+  return (1 - idle / total) * after.cores;
+}
+
+export function hostCpuAdmissionSlots(enabled: boolean, pendingWorkers: number): number {
+  if (!enabled) return Infinity;
+  try {
+    const parallelism = availableParallelism();
+    let load: number | undefined;
+    if (process.platform !== 'win32') {
+      // Includes runnable and, on Linux, uninterruptible work: intentionally conservative.
+      load = loadavg()[0];
+    } else {
+      const counters = cpus();
+      const now = { at: Date.now(), total: 0, idle: 0, cores: counters.length };
+      for (const cpu of counters) {
+        now.total += Object.values(cpu.times).reduce((sum, tick) => sum + tick, 0);
+        now.idle += cpu.times.idle;
+      }
+      if (!previousTicks || now.at < previousTicks.at || now.at - previousTicks.at >= 1000) {
+        lastCpuLoad = previousTicks ? cpuLoadFromTicks(previousTicks, now) : undefined;
+        previousTicks = now;
+      }
+      load = lastCpuLoad;
+    }
+    return cpuAdmissionSlots({ enabled, parallelism, load: load ?? NaN, pendingWorkers });
   } catch { return 0; }
 }

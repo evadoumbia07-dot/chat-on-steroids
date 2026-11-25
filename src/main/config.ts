@@ -182,6 +182,7 @@ const DEFAULT_MULTI_AGENT: MultiAgentSettings = {
   // independent prime families. Existing per-family maxWorkers remains authoritative too.
   globalMaxWorkers: 0,
   hostMemoryGuard: false,
+  hostCpuGuard: false,
   // Off: automatic sends go out as soon as their chat is ready, however many chats work (#1694).
   chatsAtOnce: 0,
   allowUnattributedCalls: false,
@@ -543,6 +544,7 @@ const configSchema = z.object({
       maxWorkers: z.number().int().min(1).max(8).optional().default(DEFAULT_MULTI_AGENT.maxWorkers),
       globalMaxWorkers: z.number().int().min(0).max(64).optional().default(DEFAULT_MULTI_AGENT.globalMaxWorkers ?? 0),
       hostMemoryGuard: z.boolean().optional().default(false),
+      hostCpuGuard: z.boolean().optional().default(false),
       chatsAtOnce: z.number().int().min(0).max(10).optional().catch(0).default(DEFAULT_MULTI_AGENT.chatsAtOnce ?? 0),
       allowUnattributedCalls: z.boolean().optional().default(DEFAULT_MULTI_AGENT.allowUnattributedCalls),
       strictChatAllowlist: z.boolean().optional().default(DEFAULT_MULTI_AGENT.strictChatAllowlist ?? false),
@@ -558,6 +560,7 @@ const configSchema = z.object({
       maxWorkers: DEFAULT_MULTI_AGENT.maxWorkers,
       globalMaxWorkers: DEFAULT_MULTI_AGENT.globalMaxWorkers ?? 0,
       hostMemoryGuard: false,
+      hostCpuGuard: false,
       chatsAtOnce: DEFAULT_MULTI_AGENT.chatsAtOnce ?? 0,
       allowUnattributedCalls: DEFAULT_MULTI_AGENT.allowUnattributedCalls,
       strictChatAllowlist: DEFAULT_MULTI_AGENT.strictChatAllowlist ?? false,

@@ -35,14 +35,22 @@ function enabled(): void {
   if (!config.multiAgent.enabled) throw new RequestError(403, 'workers_disabled');
 }
 
-async function status(caller: Caller) {
-  await measureSleepingWorkers(caller);
+function assertReadProfile(caller: Caller): void {
   enabled();
+  if ((getConfig().tunnel.profileId ?? 'default') !== caller.setupProfileId) {
+    throw new RequestError(409, 'connection_profile_changed');
+  }
+}
+
+async function status(caller: Caller) {
+  assertReadProfile(caller);
+  await measureSleepingWorkers(caller);
+  assertReadProfile(caller);
   const current = statusForCaller(caller);
   const workers = [];
   for (const worker of current.state.agents.filter(agent => agent.role === 'worker')) {
     const session = worker.conversationId ? await findSessionByConversation(worker.conversationId, { requireUnique: true }) : null;
-    enabled();
+    assertReadProfile(caller);
     workers.push({ id: worker.id, runId: worker.runId ?? null, label: worker.label, state: worker.state,
       conversationId: worker.conversationId, sessionId: session?.id ?? null, revivable: worker.revivable,
       pending: worker.pending, awaitingAck: worker.awaitingAck, contextTokens: worker.contextTokens });
@@ -51,8 +59,12 @@ async function status(caller: Caller) {
   // may bind this *observed* native identity to its own mission registry, but
   // must not invent the ChatGPT conversation, claim worker ownership, or treat
   // a CoS result as an independent PostgreSQL mission acknowledgement.
-  return { nativeBroker: nativeBrokerIdentity(caller, current.runId),
+  // statusForCaller has already verified the caller-selected run. A parked
+  // family has no active incarnation, but the selected historical identity
+  // must survive a restart so the supervisor can reconcile without spawning.
+  return { nativeBroker: nativeBrokerIdentity(caller, current.runId ?? caller.runId),
     runId: current.runId, freeWorkerSlots: current.freeWorkerSlots,
+    admissibleWorkerSlots: current.admissibleWorkerSlots,
     retainedHistory: current.state.retainedHistory === true,
     // Derived strictly from this owner-scoped, already authenticated CoS
     // projection. ECOM OS must not infer external workers or a SQL ACK from it.

@@ -56,7 +56,7 @@ const MODEL_REQUEST_TIMEOUT_MS = 190_000;
 /** The reason a deadline aborts with, so it is a fact the caller can act on rather than prose. */
 const TIMED_OUT = 'the app took too long to answer';
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 14;
+const BRIDGE_PROTOCOL = 15;
 /** Browser-owned presentation preferences also exposed by the popup. */
 const RENDER_STREAM_KEY = 'renderStreamEnabled';
 const SHOW_TIMES_KEY = 'showStreamTimes';
@@ -187,6 +187,8 @@ const journalPreferences = new Set();
 let delivery = { at: 0, ok: null, events: 0, total: 0, conversationId: null, status: 0, error: null };
 /** Idempotent conversation-close deliveries awaiting an app ACK. */
 let closeOutbox = [];
+/** Last autonomous close decision, without chat IDs, for the existing /diagnostics report. */
+let closeOutboxDecision = null;
 /** Successful managed removals awaiting onRemoved; exact document receipts survive MV3 sleep. */
 let tabRemovals = {};
 /**
@@ -373,6 +375,14 @@ async function loadOnce() {
   stored.inputOpenings = { ...(stored.desktopInputTabs || {}), ...(stored.inputOpenings || {}) };
   inputOpenings = stored.inputOpenings && typeof stored.inputOpenings === 'object' && !Array.isArray(stored.inputOpenings)
     ? Object.fromEntries(Object.entries(stored.inputOpenings).filter(([id, row]) => /^[a-f0-9-]{36}$/i.test(id) && row && (row.tab === null || Number.isInteger(row.tab))).slice(-1000)) : {};
+  // Elections saved under the old key move once into `inputOpenings`: left behind, one forgotten
+  // there would come back at the next start (CodeRabbit on #1980).
+  if (stored.desktopInputTabs !== undefined) {
+    try {
+      await chrome.storage.local.set({ inputOpenings });
+      await chrome.storage.local.remove('desktopInputTabs');
+    } catch { /* The next start merges them again; nothing is lost. */ }
+  }
   stopOpenings = stored.stopOpenings && typeof stored.stopOpenings === 'object' && !Array.isArray(stored.stopOpenings)
     ? Object.fromEntries(Object.entries(stored.stopOpenings).filter(([id, row]) => commandMarkerId(id) && row &&
       (row.tab === null || Number.isInteger(row.tab)) && cleanConversationId(row.conversationId) &&
@@ -1211,11 +1221,12 @@ function forgetPort() {
  * not user intent to reconnect. Only an explicit successful pair clears the local latch.
  */
 async function latchAppDisconnect() {
+  clearDesktopInputRetries();
   closeWakeSocket();
   void getBrowserController().then(controller => controller?.revoke()).catch(() => undefined);
   token = null;
   disconnected = true;
-  await activeTabs?.revoke().catch(() => undefined);
+  await renderingLeases(() => activeTabs?.revoke());
   await persist();
 }
 
@@ -1234,7 +1245,8 @@ async function call(path, init = {}, retried = false) {
     const got = await provision();
     if (!got.ok) return { ok: false, status: 401, error: got.error || 'not_paired' };
   }
-  const { timeoutMs = REQUEST_TIMEOUT_MS, ...rest } = init;
+  const { timeoutMs = REQUEST_TIMEOUT_MS, isCurrent, ...rest } = init;
+  if (isCurrent && !isCurrent()) return { ok: false, status: 0, error: 'stale_document' };
   try {
     const response = await fetchBounded(
       `http://127.0.0.1:${found.port}${path}`,
@@ -2225,6 +2237,13 @@ async function protectCreatedTab(tab, commandId = null) {
 }
 
 /** Bound waiting for a page; a missing reply never grants action or replay authority. */
+/** How long a status pass waits for the rendering leases before it goes on to its repairs. */
+const RENDERING_LEASE_WAIT_MS = 3000;
+/** A rendering lease change, waited for a bounded time and never failing its caller; it goes on by itself. */
+function renderingLeases(change) {
+  return browserReply(async () => { await change(); return null; }, RENDERING_LEASE_WAIT_MS);
+}
+
 async function browserReply(read, timeoutMs = 3000) {
   let timer;
   try {
@@ -2249,11 +2268,88 @@ function prepareDesktopInputReceipt(tabId, id, documentId) {
   return tabReply(tabId, { type: 'clf-prepare-desktop-input', id }, { documentId }, 15000);
 }
 
+const DESKTOP_INPUT_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
+const desktopInputOfferRetries = new Map();
+
+function clearDesktopInputRetry(id, expectedTabId) {
+  const state = desktopInputOfferRetries.get(id);
+  if (!state) return;
+  if (expectedTabId !== undefined && state.tabId !== expectedTabId) return;
+  if (state.timer !== null) clearTimeout(state.timer);
+  desktopInputOfferRetries.delete(id);
+}
+
+function clearDesktopInputRetries() {
+  for (const id of [...desktopInputOfferRetries.keys()]) clearDesktopInputRetry(id);
+}
+
+function resumeDeferredDesktopInputRetries() {
+  if (!token || disconnected || extensionReloadPending) return;
+  let resume = false;
+  for (const [id, state] of [...desktopInputOfferRetries.entries()]) {
+    if (!state.deferredWhileReloading) continue;
+    state.deferredWhileReloading = false;
+    if (inputOpenings[id]?.tab !== state.tabId) {
+      clearDesktopInputRetry(id, state.tabId);
+      continue;
+    }
+    resume = true;
+  }
+  if (resume) void maintain(true).catch(() => undefined);
+}
+
+function scheduleDesktopInputRetry(id, tabId, reason) {
+  if (!token || disconnected) return;
+  if (inputOpenings[id]?.tab !== tabId) { clearDesktopInputRetry(id, tabId); return; }
+  const existing = desktopInputOfferRetries.get(id);
+  const state = existing && existing.tabId === tabId
+    ? existing
+    : { tabId, attempts: 0, timer: null, exhaustedLogged: false, deferredWhileReloading: false };
+  if (existing && existing !== state && existing.timer !== null) clearTimeout(existing.timer);
+  if (state.timer !== null) return;
+  if (state.attempts >= DESKTOP_INPUT_RETRY_DELAYS_MS.length) {
+    if (!state.exhaustedLogged) {
+      state.exhaustedLogged = true;
+      console.info(`desktop input ${id}: fast retries exhausted on tab ${tabId} (${reason}); waiting for next alarm or page event`);
+    }
+    desktopInputOfferRetries.set(id, state);
+    return;
+  }
+  const delayMs = DESKTOP_INPUT_RETRY_DELAYS_MS[state.attempts];
+  state.attempts += 1;
+  state.deferredWhileReloading = false;
+  console.info(`desktop input ${id}: retry ${state.attempts} scheduled in ${delayMs} ms (tab ${tabId} ${reason})`);
+  state.timer = setTimeout(() => {
+    state.timer = null;
+    if (!token || disconnected) return;
+    if (inputOpenings[id]?.tab !== tabId) { clearDesktopInputRetry(id, tabId); return; }
+    if (extensionReloadPending) {
+      state.deferredWhileReloading = true;
+      return;
+    }
+    void maintain(true).catch(() => undefined);
+  }, delayMs);
+  desktopInputOfferRetries.set(id, state);
+}
+
 function offerDesktopInput(tabId, message) {
+  const election = inputOpenings[message.id];
   // The reply is not a delivery receipt: the content script synchronously owns
   // one desktopInputBusy slot, then the app's durable browser claim and one-time
   // sendAuthorizedAt fence every later offer. Waiting here only starves repairs.
-  void chrome.tabs.sendMessage(tabId, message).catch(() => undefined);
+  // If the page is still hydrating or busy, schedule a bounded fast retry instead
+  // of leaving the message unclaimed until the 30-second maintenance alarm.
+  void chrome.tabs.sendMessage(tabId, message).then(
+    reply => {
+      if (!election || inputOpenings[message.id] !== election || election.tab !== tabId) return;
+      if (reply?.ok === true) { clearDesktopInputRetry(message.id, tabId); return; }
+      if (reply?.ok === false) scheduleDesktopInputRetry(message.id, tabId, 'declined');
+    },
+    () => {
+      if (!election || inputOpenings[message.id] !== election || election.tab !== tabId) return;
+      scheduleDesktopInputRetry(message.id, tabId, 'unreachable');
+    }
+  );
 }
 
 // Missing-tab reports only expose a pre-claim failure in main; they never
@@ -2265,7 +2361,15 @@ const MAX_OPENING_UNAVAILABLE_REPORTS = 3;
 function reportUnavailableOpening(id, tab, stage) {
   if (openingUnavailableReports.has(id) || openingUnavailableReports.size >= MAX_OPENING_UNAVAILABLE_REPORTS) return;
   const pending = call('/input/opening-unavailable', { method: 'POST',
-    body: JSON.stringify({ id, tab, stage }) });
+    body: JSON.stringify({ id, tab, stage }) }).then(async reply => {
+    // The app proved nothing reached the lost tab and grants a fresh one: forget the old election,
+    // so the next pass opens a new tab for this new chat (#1950 follow-up). Only then.
+    if (reply?.ok && reply.data?.reopen === true && inputOpenings[id]?.tab === tab) {
+      delete inputOpenings[id];
+      await persistLive();
+    }
+    return reply;
+  });
   openingUnavailableReports.set(id, pending);
   void pending.catch(() => undefined).finally(() => {
     if (openingUnavailableReports.get(id) === pending) openingUnavailableReports.delete(id);
@@ -2281,9 +2385,16 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
   if (Array.isArray(activeIds)) {
     const active = new Set(activeIds);
     for (const id of Object.keys(inputOpenings)) if (!active.has(id)) delete inputOpenings[id];
+    for (const id of [...desktopInputOfferRetries.keys()]) if (!active.has(id)) clearDesktopInputRetry(id);
     await persistLive();
+  } else {
+    const offered = new Set(inputs.map(input => input?.id).filter(Boolean));
+    for (const id of [...desktopInputOfferRetries.keys()]) if (!offered.has(id)) clearDesktopInputRetry(id);
   }
-  if (!inputs.length) return;
+  if (!inputs.length) {
+    clearDesktopInputRetries();
+    return;
+  }
   let tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
   const elections = inputOpenings;
   const elect = async (id, record) => {
@@ -2408,6 +2519,7 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
     // Losing it never authorizes another creation or a transfer to a different chat.
     if (tab && !elected) await elect(input.id, { tab: tab.id, stage: 'ready', conversationId: target });
     if (!tab) {
+      clearDesktopInputRetry(input.id);
       // Handout is opening authority, not a missing delivery receipt. A closed or
       // unresponsive elected document never grants another opening attempt.
       if (elections[input.id] && !recoveredReuse) {
@@ -2622,13 +2734,15 @@ let projectCreateFlight = null;
 /** A helper the person closed is opened again, but not more often than this. */
 const PROJECT_CREATE_REOPEN_MS = 120_000;
 function inspectProjectCreates(requests) {
+  // An unavailable catalog is not an empty/completed list. Keep the current helper and owner.
+  if (!Array.isArray(requests)) return;
   if (projectCreateFlight) return projectCreateFlight;
   // A page that just finished a creation answers after the app has already asked for the next pass,
   // which this flight then turned away; so a flight that asked a page runs one more pass itself, or a
   // second project added right after the first waited for an unrelated wake (measured 2026-10-10).
   let asked = false;
   projectCreateFlight = (async () => {
-    const list = (Array.isArray(requests) ? requests : [])
+    const list = requests
       .filter(request => request && /^[a-f0-9-]{36}$/i.test(String(request.id)) && typeof request.name === 'string' && request.name);
     const owner = (await chrome.storage.session.get('projectCreateOwner')).projectCreateOwner;
     if (owner && !list.some(request => request.id === owner.id)) {
@@ -2848,7 +2962,9 @@ function inspectRequestedModels(request) {
       ...(typeof tabDocuments[key] === 'string' ? { documentId: tabDocuments[key] } : {}),
       ...(Number.isSafeInteger(tabEpochs[key]) ? { navigationEpoch: tabEpochs[key] } : {}) });
     if (intent !== connectionEpoch || !token || disconnected || Date.now() >= wanted.expiresAt) return;
-    await activeTabs?.set(`catalog:${wanted.nonce}`, [tab]);
+    // Bounded and never failing, like every lease change: another tab's pending release must not end this
+    // inspection (CodeRabbit on #2027).
+    await renderingLeases(() => activeTabs?.set(`catalog:${wanted.nonce}`, [tab]));
     await waiting('inspecting');
     if (!current()) return;
     const inspected = await send({ type: 'clf-model-catalog', nonce: wanted.nonce, expiresAt: wanted.expiresAt });
@@ -2857,7 +2973,7 @@ function inspectRequestedModels(request) {
     if (inspected === true || inspected?.ok === true) await retireCatalogTabs();
     else await waiting(inspected?.reason || 'result_unconfirmed');
   })().catch(() => waiting('inspection_failed')).finally(async () => {
-    if (targetNonce) await activeTabs?.set(`catalog:${targetNonce}`, []).catch(() => undefined);
+    if (targetNonce) await renderingLeases(() => activeTabs?.set(`catalog:${targetNonce}`, []));
     if (targetNonce) await releaseModelCatalogTarget(targetNonce);
     modelCatalogFlight = null;
   });
@@ -2888,9 +3004,133 @@ globalThis.chrome?.debugger?.onDetach.addListener(source => {
   void activeTabs?.detached(source).catch(() => undefined);
   void getBrowserController().then(controller => controller?.detached(source)).catch(() => undefined);
 });
+const ACTIVITY_WAKE_BURST = 6;
+const ACTIVITY_WAKE_INTERVAL_MS = 200;
+const ACTIVITY_WAKE_QUEUE_CAP = 64;
+let activityWakeTokens = ACTIVITY_WAKE_BURST;
+let activityWakeLastRefillAt = 0;
+let activityWakeDrainTimer = null;
+let activityWakeEpoch = 0;
+const pendingActivityWakeTabs = new Map();
+
+function resetActivityWakeLimiter() {
+  activityWakeEpoch += 1;
+  if (activityWakeDrainTimer !== null) {
+    clearTimeout(activityWakeDrainTimer);
+    activityWakeDrainTimer = null;
+  }
+  pendingActivityWakeTabs.clear();
+  activityWakeTokens = ACTIVITY_WAKE_BURST;
+  activityWakeLastRefillAt = 0;
+}
+
 function closeWakeSocket() {
+  resetActivityWakeLimiter();
   const previous = wakeSocket; wakeSocket = null;
   if (previous) previous.close();
+}
+
+function takeActivityWakeToken(now = Date.now()) {
+  if (activityWakeLastRefillAt === 0) activityWakeLastRefillAt = now;
+  else if (now > activityWakeLastRefillAt) {
+    const gained = Math.floor((now - activityWakeLastRefillAt) / ACTIVITY_WAKE_INTERVAL_MS);
+    if (gained > 0) {
+      activityWakeTokens = Math.min(ACTIVITY_WAKE_BURST, activityWakeTokens + gained);
+      activityWakeLastRefillAt += gained * ACTIVITY_WAKE_INTERVAL_MS;
+    }
+  }
+  if (activityWakeTokens <= 0) return false;
+  activityWakeTokens -= 1;
+  return true;
+}
+
+function dispatchActivityWakeToTab(id, target) {
+  if (disconnected || typeof chrome.tabs?.sendMessage !== 'function') return;
+  const message = target ? { type: 'clf-activity-wake', conversationId: target } : { type: 'clf-activity-wake' };
+  try {
+    void chrome.tabs.sendMessage(id, message).catch(() => undefined);
+  } catch {
+    // Tab may be navigating/unloading; ordinary fallback polling still delivers.
+  }
+}
+
+function drainActivityWakeTabs() {
+  activityWakeDrainTimer = null;
+  if (disconnected || typeof chrome.tabs?.sendMessage !== 'function') {
+    resetActivityWakeLimiter();
+    return;
+  }
+  while (pendingActivityWakeTabs.size > 0 && takeActivityWakeToken()) {
+    const next = pendingActivityWakeTabs.entries().next().value;
+    if (!next) break;
+    const [tabId, target] = next;
+    pendingActivityWakeTabs.delete(tabId);
+    dispatchActivityWakeToTab(tabId, target);
+  }
+  if (pendingActivityWakeTabs.size > 0) {
+    const now = Date.now();
+    const waitMs = activityWakeLastRefillAt === 0
+      ? ACTIVITY_WAKE_INTERVAL_MS
+      : Math.max(1, ACTIVITY_WAKE_INTERVAL_MS - (now - activityWakeLastRefillAt));
+    activityWakeDrainTimer = setTimeout(drainActivityWakeTabs, waitMs);
+  }
+}
+
+function queueActivityWakeTab(id, target) {
+  if (pendingActivityWakeTabs.size === 0 && takeActivityWakeToken()) {
+    dispatchActivityWakeToTab(id, target);
+    return;
+  }
+  if (pendingActivityWakeTabs.has(id)) {
+    const prev = pendingActivityWakeTabs.get(id);
+    pendingActivityWakeTabs.set(id, prev === target ? target : null);
+  } else {
+    if (pendingActivityWakeTabs.size >= ACTIVITY_WAKE_QUEUE_CAP) {
+      const oldest = pendingActivityWakeTabs.keys().next().value;
+      if (oldest !== undefined) pendingActivityWakeTabs.delete(oldest);
+    }
+    pendingActivityWakeTabs.set(id, target);
+  }
+  if (activityWakeDrainTimer === null) {
+    const now = Date.now();
+    const waitMs = activityWakeLastRefillAt === 0
+      ? ACTIVITY_WAKE_INTERVAL_MS
+      : Math.max(1, ACTIVITY_WAKE_INTERVAL_MS - (now - activityWakeLastRefillAt));
+    activityWakeDrainTimer = setTimeout(drainActivityWakeTabs, waitMs);
+  }
+}
+
+/** Unions registry-known tab IDs with matching open ChatGPT tabs (discovering unregistered tabs). */
+async function unionQueriedChatGptTabs(knownIds, target = null) {
+  let queried = [];
+  if (typeof chrome.tabs?.query === 'function') {
+    try {
+      const discovered = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+      queried = discovered
+        .filter((tab) => tab && typeof tab.id === 'number' && Number.isInteger(tab.id) &&
+          (!target || conversationFromUrl(tab.url) === target))
+        .map((tab) => tab.id);
+    } catch {
+      queried = [];
+    }
+  }
+  return [...new Set([...knownIds, ...queried])];
+}
+
+/** Wakes matching open ChatGPT tab(s) so `/activity` reacts without waiting for the poll timer. */
+async function notifyActivityTabs(conversationId) {
+  const epoch = activityWakeEpoch;
+  await load();
+  if (disconnected || epoch !== activityWakeEpoch || typeof chrome.tabs?.sendMessage !== 'function') return;
+  const target = conversationId ? cleanConversationId(conversationId) : null;
+  if (conversationId && !target) return;
+  const known = Object.entries(tabConversations)
+    .filter(([, value]) => !target || cleanConversationId(value) === target)
+    .map(([key]) => Number(key))
+    .filter((id) => Number.isInteger(id));
+  const tabIds = await unionQueriedChatGptTabs(known, target);
+  if (disconnected || epoch !== activityWakeEpoch || typeof chrome.tabs?.sendMessage !== 'function') return;
+  for (const id of tabIds) queueActivityWakeTab(id, target);
 }
 function connectWakeSocket() {
   if (!token || disconnected || !port || typeof WebSocket === 'undefined') return;
@@ -2912,12 +3152,17 @@ function connectWakeSocket() {
     else if (event.data === 'wake') {
       void pumpBrowserControl().catch(() => undefined);
       void maintain(true).catch(() => undefined);
+    } else if (event.data === 'activity') {
+      void notifyActivityTabs(null).catch(() => undefined);
+    } else if (typeof event.data === 'string' && event.data.startsWith('activity:')) {
+      void notifyActivityTabs(event.data.slice('activity:'.length)).catch(() => undefined);
     }
   };
   connection.onerror = () => connection.close();
   connection.onclose = () => {
     if (wakeSocket === connection) {
       wakeSocket = null;
+      resetActivityWakeLimiter();
       void activeTabs?.revoke().catch(() => undefined);
     }
   };
@@ -3205,6 +3450,46 @@ async function followAppNow(data) {
 }
 
 /**
+ * The popup paints with the app's colors and theme (the app's extension-appearance.ts sends them with
+ * every status). Stored when they change, so a popup opened while the app is closed keeps the last look.
+ */
+const APP_APPEARANCE_KEY = 'appAppearance';
+const APPEARANCE_THEMES = new Set(['light', 'dark', 'system']);
+// Every color the app sends (main/extension-appearance.ts); a palette missing one is no palette.
+const APPEARANCE_TOKENS = ['--page', '--card', '--ink', '--soft', '--faint', '--line', '--edge', '--hover', '--track',
+  '--accent', '--accent-wash', '--accent-fill', '--on-accent', '--knob-off', '--knob-on', '--green', '--green-wash',
+  '--red', '--red-wash'];
+let appAppearanceApplied = null;
+let appAppearanceWriting = null;
+let appAppearancePending = null;
+function validAppearanceTokens(tokens) {
+  if (!tokens || typeof tokens !== 'object' || Array.isArray(tokens)) return false;
+  const entries = Object.entries(tokens);
+  return entries.length > 0 && entries.length <= 40 && entries.every(([name, value]) => /^--[a-z-]{2,30}$/.test(name) && /^#[0-9a-f]{6}$/i.test(value)) &&
+    APPEARANCE_TOKENS.every(name => Object.hasOwn(tokens, name));
+}
+function followAppearance(value) {
+  if (!value || !APPEARANCE_THEMES.has(value.theme) || !validAppearanceTokens(value.light) || !validAppearanceTokens(value.dark)) return;
+  writeAppearance(JSON.stringify({ theme: value.theme, light: value.light, dark: value.dark }));
+}
+function writeAppearance(json) {
+  // One write at a time. Colors that arrive meanwhile wait, and only the newest of them is written
+  // after it: a theme changed during a slow write is not lost if no status follows.
+  if (appAppearanceWriting) { appAppearancePending = json; return; }
+  appAppearancePending = null;
+  if (json === appAppearanceApplied) return;
+  appAppearanceWriting = boundedStorage(chrome.storage.local.set({ [APP_APPEARANCE_KEY]: JSON.parse(json) }), 'write')
+    .then(() => { appAppearanceApplied = json; })
+    // A write that failed or timed out may still land later: nothing is known to be stored, so the
+    // next colors are written even when they equal the last ones written (CodeRabbit on #2013).
+    .catch(() => { appAppearanceApplied = null; })
+    .finally(() => {
+      appAppearanceWriting = null;
+      if (appAppearancePending) writeAppearance(appAppearancePending);
+    });
+}
+
+/**
  * "Open in ChatGPT" from the app, shown in this browser: the chat's tab if it has one, else a new
  * one. The app asks here rather than the OS, which can pick another browser or account (#882).
  */
@@ -3311,16 +3596,21 @@ async function revealChats(ids) {
   for (const raw of ids.slice(0, 5)) {
     const conversationId = cleanConversationId(raw);
     if (!conversationId) continue;
-    const tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
-    const [tab] = tabs.filter(candidate => conversationForTab(candidate) === conversationId).sort((a, b) => a.id - b.id);
-    const shown = tab
-      ? await chrome.tabs.update(tab.id, { active: true })
-      : await createUserWindowTab(`https://chatgpt.com/c/${conversationId}`, true);
-    const windowId = shown?.windowId ?? tab?.windowId;
-    if (!Number.isInteger(windowId)) continue;
-    // A worker tab can sit in the app's minimized background window; the user asked to see it.
-    const window = await chrome.windows.get(windowId).catch(() => null);
-    await chrome.windows.update(windowId, window?.state === 'minimized' ? { state: 'normal', focused: true } : { focused: true });
+    try {
+      const tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+      const [tab] = tabs.filter(candidate => conversationForTab(candidate) === conversationId).sort((a, b) => a.id - b.id);
+      const shown = tab
+        ? await chrome.tabs.update(tab.id, { active: true })
+        : await createUserWindowTab(`https://chatgpt.com/c/${conversationId}`, true);
+      const windowId = shown?.windowId ?? tab?.windowId;
+      if (!Number.isInteger(windowId)) throw new Error('no window');
+      // A worker tab can sit in the app's minimized background window; the user asked to see it.
+      const window = await chrome.windows.get(windowId).catch(() => null);
+      await chrome.windows.update(windowId, window?.state === 'minimized' ? { state: 'normal', focused: true } : { focused: true });
+    } catch {
+      // Taking the chat is not showing it: say so, so the app does not count it as shown (CodeRabbit on #2027).
+      await call('/reveal/failed', { method: 'POST', body: JSON.stringify({ conversationId }) }).catch(() => undefined);
+    }
   }
 }
 
@@ -3412,6 +3702,7 @@ async function reloadForExtensionUpdate(offer, liveOpenings, liveCommands, liveS
     }
   }
   extensionReloadPending = true;
+  let reloading = false;
   try {
     const prepared = await call('/extension/update', { method: 'POST',
       body: JSON.stringify(busyFor ? { pastBusyChatsMs: busyFor } : {}) });
@@ -3422,17 +3713,58 @@ async function reloadForExtensionUpdate(offer, liveOpenings, liveCommands, liveS
     if (!prepared.ok || prepared.data?.ready !== true || prepared.data.build !== offer.build) { extensionUpdateHold = 'folder-not-ready'; return; }
     extensionUpdateHold = null;
     await chrome.storage.local.set({ extensionReloadAttempt: attempt });
+    if (typeof clearDesktopInputRetries === 'function') clearDesktopInputRetries();
+    reloading = true;
     chrome.runtime.reload();
   } finally {
     extensionReloadPending = false;
+    if (!reloading && typeof resumeDeferredDesktopInputRetries === 'function') resumeDeferredDesktopInputRetries();
   }
+}
+
+async function checkWebChatTitle(request) {
+  const id = request?.id;
+  const conversationId = cleanConversationId(request?.conversationId);
+  if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/i.test(id) || !conversationId) return;
+  const intent = connectionEpoch;
+  let title = null;
+  let reason = 'no-matching-tab';
+  try {
+    const matchingTabs = async () => (await chrome.tabs.query({ url: CHATGPT_TAB_URLS })).filter(tab =>
+      Number.isInteger(tab.id) && !tab.incognito && conversationFromUrl(tab.url) === conversationId);
+    const ready = tab => tab && !tab.pendingUrl && !tab.discarded && !tab.frozen && tab.status === 'complete';
+    const tabs = await matchingTabs();
+    const [tab] = tabs;
+    if (tabs.length > 1) {
+      reason = 'multiple-matching-tabs';
+    } else if (tab && !ready(tab)) {
+      reason = 'tab-unavailable';
+    } else if (tab) {
+      const documentId = tabDocuments[String(tab.id)];
+      const source = { tab: tab.id, documentId, navigationEpoch: tabEpochs[String(tab.id)] };
+      reason = 'document-unregistered';
+      if (ownsDocument(source)) {
+        const answer = await tabReply(tab.id, { type: 'clf-check-web-chat-title', conversationId }, { documentId }, 3000);
+        const currentTabs = await matchingTabs();
+        const [current] = currentTabs;
+        reason = 'document-changed';
+        if (currentTabs.length === 1 && ready(current) && current.id === tab.id && current.url === tab.url &&
+            ownsDocument(source)) {
+          reason = answer ? 'title-unconfirmed' : 'page-unresponsive';
+          if (typeof answer?.title === 'string' && answer.title.length <= 200) title = answer.title.trim() || null;
+        }
+      }
+    }
+  } catch { reason = 'browser-error'; }
+  if (intent !== connectionEpoch || !token || disconnected) return;
+  await call('/browser/web-chat-title', { method: 'POST', body: JSON.stringify({ id, conversationId, title, ...(title === null ? { reason } : {}) }) });
 }
 
 async function maintainOnce() {
   // The app decides whether there is recovery work; a worker holding no tabs is not a worker
   // with nothing to do, it is the one that has to open the chat the app is owed.
   if (token === null) {
-    await activeTabs?.revoke();
+    await renderingLeases(() => activeTabs?.revoke());
     if (!(await ensurePaired().catch(() => false)) || token === null) return;
   }
   const intent = connectionEpoch;
@@ -3467,7 +3799,7 @@ async function maintainOnce() {
     chatGptSignedIn: chatGptSignedInState, ...(typeof chatgptAccess === 'boolean' ? { chatgptAccess } : {}),
     ...(extensionUpdateHold ? { updateHold: extensionUpdateHold } : {}) }) });
   if (intent !== connectionEpoch || !token || disconnected) return;
-  if (!reply.ok || !reply.data) { await activeTabs?.revoke(); return; }
+  if (!reply.ok || !reply.data) { await renderingLeases(() => activeTabs?.revoke()); return; }
   await rememberBackgroundPlacement(reply.data.backgroundPlacement);
   const liveChats = new Set(Array.isArray(reply.data.nonDiscardableConversations) ? reply.data.nonDiscardableConversations : []);
   const liveOpenings = new Set(Array.isArray(reply.data.inputOpeningIds) ? reply.data.inputOpeningIds : []);
@@ -3475,9 +3807,11 @@ async function maintainOnce() {
   const liveSending = Array.isArray(reply.data.inputSendingIds) ? new Set(reply.data.inputSendingIds) : null;
   void reloadForExtensionUpdate(reply.data.extensionUpdate, liveOpenings, liveCommands, liveSending).catch(() => undefined);
   void followApp(reply.data).catch(() => undefined);
+  followAppearance(reply.data.appearance);
   void revealChats(reply.data.reveals).catch(() => undefined);
   void followChat(reply.data.follow).catch(() => undefined);
   void runImageExports(reply.data.imageExports).catch(() => undefined);
+  if (reply.data.webChatTitleCheck) void checkWebChatTitle(reply.data.webChatTitleCheck).catch(() => undefined);
   // Only the app's own list of open messages may call a marked page left over; an older app sends none.
   if (Array.isArray(reply.data.inputOpeningIds)) void closeLeftoverOpenings(observedTabs, liveOpenings,
     new Set((Array.isArray(reply.data.inputs) ? reply.data.inputs : []).map(input => input?.id)),
@@ -3520,8 +3854,11 @@ async function maintainOnce() {
   const refreshRendering = async (tabs) => {
     if (!activeTabs || intent !== connectionEpoch || !token || disconnected) return;
     tabs ||= await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+    // Bounded, and never fatal to the pass: a lease is a debugger command to each background chat tab,
+    // and one that never answered, or failed to release, kept every later pass from reaching its repairs
+    // (2026-11-01: a Loop chat's repairs were handed out ten times and never claimed, twice).
     if (intent === connectionEpoch && token && !disconnected)
-      await activeTabs.set('policy', tabs.filter(renderingWanted), renderingWanted);
+      await renderingLeases(() => activeTabs.set('policy', tabs.filter(renderingWanted), renderingWanted));
   };
   // Reuse the app's current work policy. Old history, pins and tab presence do not qualify.
   await refreshRendering(observedTabs);
@@ -3540,7 +3877,12 @@ async function maintainOnce() {
       requiresClaim: entry?.requiresClaim === true,
       continueFollows: entry?.continueFollows === true,
       suspended: entry?.reason === 'stalled',
-      focus: Boolean(entry && entry.focus === true)
+      focus: Boolean(entry && entry.focus === true),
+      // The app's own automatic sends in this chat, with their message ids (#2074): bounded, well-formed only.
+      ...(Array.isArray(entry?.ownSent) ? { ownSent: entry.ownSent
+        .filter((sent) => sent && typeof sent.text === 'string' && sent.text.length <= 100_000 &&
+          typeof sent.messageId === 'string' && sent.messageId.length <= 200)
+        .map((sent) => ({ text: sent.text, messageId: sent.messageId })).slice(0, 10) } : {})
     }))
     .filter((entry) => entry.conversationId && entry.token);
   // Fulfilling a due repair must not wait behind window layout, input preparation
@@ -3665,7 +4007,7 @@ function repairChangeDetail(latest) {
 }
 
 async function performBrowserRepairs(repairs, policy) {
-  for (const { conversationId, token, reason, focus, requiresClaim, continueFollows, suspended } of repairs) {
+  for (const { conversationId, token, reason, focus, requiresClaim, continueFollows, suspended, ownSent } of repairs) {
     // Re-scanned per repair rather than reused from above. Earlier entries in this same batch
     // may have created a tab, and the scan has to be the state immediately before the action or
     // the duplicate rule below is deciding on a tab list that no longer exists.
@@ -3714,8 +4056,12 @@ async function performBrowserRepairs(repairs, policy) {
         // own busy page is what it may recover, not an ordinary turn to keep idle.
         const inspectTurn = target && !suspended;
         const draftOnly = reason === 'compaction';
+        // The exact texts the app sent into this chat by itself: one restored into the box is its own
+        // leftover, not the person's draft (#2074).
+        const own = Array.isArray(ownSent) ? { ownSent } : {};
         const check = inspectTurn ? await tabReply(target.id,
-          { type: 'clf-repair-check', conversationId, draftOnly }, documentId ? { documentId } : undefined) : null;
+          { type: 'clf-repair-check', conversationId, draftOnly, ...own }, documentId ? { documentId } : undefined) : null;
+        if (check?.cleared === 'own-sent') await call(`/status?repairCleared=${encodeURIComponent(token)}`);
         if (check?.safe === false) {
           // The repair stays handed for the next pass; the app logs once why the page held it.
           await call(`/status?repairHeld=${encodeURIComponent(token)}&why=${encodeURIComponent(check.why || 'unknown')}`);
@@ -3724,7 +4070,7 @@ async function performBrowserRepairs(repairs, policy) {
         const claim = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({ token }) });
         if (!claim.ok || claim.data?.allowed !== true) continue;
         if (target && !suspended) {
-          const latest = inspectTurn ? await tabReply(target.id, { type: 'clf-repair-check', conversationId, draftOnly,
+          const latest = inspectTurn ? await tabReply(target.id, { type: 'clf-repair-check', conversationId, draftOnly, ...own,
             ...(check?.safe === true ? { expected: { revision: check.revision, turnId: check.turnId, questionId: check.questionId } } : {}) },
             documentId ? { documentId } : undefined) : null;
           const tab = await chrome.tabs.get(target.id);
@@ -3822,6 +4168,10 @@ async function performBrowserRepairs(repairs, policy) {
           continue;
         }
       }
+      if (target && [target.pendingUrl, target.url].some(url => /[?&]temporary-chat=true(?:[&#]|$)/.test(url || ''))) {
+        await call(`/status?repaired=${encodeURIComponent(token)}&repairAction=preserved&preservedFor=temporary-chat`);
+        continue;
+      }
       if (target) await chrome.tabs.reload(target.id);
       else {
         await createChatTab(`https://chatgpt.com/c/${encodeURIComponent(conversationId)}`, policy.background === true, focus);
@@ -3839,6 +4189,42 @@ async function performBrowserRepairs(repairs, policy) {
 
 function conversationStillOpen(conversationId) {
   return Object.values(tabConversations).some((value) => value === conversationId);
+}
+
+/**
+ * The persisted tab-to-chat cache is an optimization, not proof that a user closed a tab.
+ * After a worker restart or a document reload, the cache can be temporarily empty even
+ * while Chrome still has the conversation open. Never file a deliberate close from that
+ * absence alone. A failed tab query must defer the close rather than assert departure.
+ */
+async function verifiedConversationGone(conversationId) {
+  if (conversationStillOpen(conversationId)) return 'present';
+  let tabs;
+  try { tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS }); }
+  catch { return 'unknown'; }
+  if (!Array.isArray(tabs)) return 'unknown';
+  // A navigation in progress still carries its *old* committed tab.url. The
+  // pending URL is authoritative for departure so we do not keep a chat open
+  // merely because the tab is on its way to a different page.
+  if (tabs.some(tab => conversationFromUrl(tab.pendingUrl || tab.url) === conversationId)) return 'present';
+  // A fresh content-script bind may have arrived while tabs.query was pending.
+  return conversationStillOpen(conversationId) ? 'present' : 'gone';
+}
+
+// Each pending close is a distinct attempt. Repeated drains may see the same
+// reason hundreds of times while a tab stays open; the activity log only needs
+// the transition. Weak keys disappear with completed/replaced outbox entries and
+// add no fields to persisted closeOutbox records.
+const closeDecisionByEntry = new WeakMap();
+function noteCloseDecision(entry, action, reason) {
+  const previous = closeDecisionByEntry.get(entry);
+  if (previous?.action === action && previous?.reason === reason) return;
+  closeDecisionByEntry.set(entry, { action, reason });
+  // Keep the reason finite and data-free. The app's existing diagnostics report
+  // logs one actionable line; the worker console also shows it immediately.
+  closeOutboxDecision = { at: Math.max(Date.now(), (closeOutboxDecision?.at || 0) + 1), action, reason };
+  console.info(`close outbox: ${action} close; ${reason}`);
+  if (typeof publishCompanionDiagnostics === 'function') void publishCompanionDiagnostics(true);
 }
 
 async function enqueueClose(conversationId, byExtension = false) {
@@ -3873,7 +4259,29 @@ async function drainCloses() {
         changed = true;
         continue;
       }
-      if (conversationStillOpen(conversationId)) continue;
+      // An extension-owned navigation already has exact authority for this
+      // departure. Its old tab URL may still be visible while Chrome navigates;
+      // checking it would incorrectly suppress the close (#1086).
+      if (entry.byExtension !== true) {
+        const presence = await verifiedConversationGone(conversationId);
+        if (presence === 'present') {
+          if (conversationStillOpen(conversationId)) {
+            // A new binding proves this queued close was superseded.
+            noteCloseDecision(entry, 'discarded', 'conversation_binding_open');
+            closeOutbox = closeOutbox.filter((candidate) => candidate !== entry);
+            changed = true;
+          } else {
+            // A close can be queued before Chrome finishes the navigation.
+            // Keep it for the next pass rather than discard the only departure.
+            noteCloseDecision(entry, 'deferred', 'chrome_tab_open');
+          }
+          continue;
+        }
+        if (presence === 'unknown') {
+          noteCloseDecision(entry, 'deferred', 'chrome_inventory_unavailable');
+          continue;
+        }
+      }
       const result = await call('/closed', {
         method: 'POST',
         // Only a proven managed removal is non-manual; legacy/unknown departures stay conservative.
@@ -4057,7 +4465,7 @@ const COMPACT_CHECKPOINT_FLAGS = [
   'destinationDispatch',
   'destinationLost'
 ];
-const COMPACT_CHECKPOINT_TEXT = ['summary', 'sourceMessageId', 'destinationMessageId', 'sourceError', 'before', 'newestUserMessage'];
+const COMPACT_CHECKPOINT_TEXT = ['summary', 'sourceMessageId', 'destinationMessageId', 'sourceError', 'sourceErrorCode', 'before', 'newestUserMessage'];
 // Not a checkpoint of its own: it qualifies `sourceMessageId` by saying how far that exact
 // marked response has grown. Sent only alongside the field it describes, so a bare count can
 // never move a deadline by itself. `documentSince` likewise only qualifies the newest message a
@@ -4088,6 +4496,36 @@ function serializeTab(tab, operation) {
   });
   tabOperationQueues.set(tab, tracked);
   return tracked;
+}
+
+/** Best-effort telemetry: one HTTP flight and one coalesced successor per tab, never tab-queue I/O. */
+const modelDiagnosticFlights = new Map();
+function queueModelDiagnostic(body, source) {
+  if (!ownsDocument(source)) return false;
+  const report = { body, source, intent: connectionEpoch }, active = modelDiagnosticFlights.get(source.tab);
+  if (active) {
+    const prior = active.next || active.current, before = prior.body.modelSelection, after = body.modelSelection;
+    if (prior.intent === report.intent && prior.source.documentId === source.documentId &&
+        prior.source.navigationEpoch === source.navigationEpoch && prior.body.id === body.id && prior.body.client === body.client &&
+        before && after && (before.attempt > after.attempt ||
+          (before.attempt === after.attempt && before.outcome !== 'pending' && after.outcome === 'pending'))) return true;
+    active.next = report;
+    return true;
+  }
+  const flight = { current: null, next: report };
+  modelDiagnosticFlights.set(source.tab, flight);
+  void (async () => {
+    try {
+      while (flight.next) {
+        const next = flight.current = flight.next;
+        flight.next = null;
+        const isCurrent = () => next.intent === connectionEpoch && !disconnected && ownsDocument(next.source);
+        if (!isCurrent()) continue;
+        await call('/commands/step', { method: 'POST', body: JSON.stringify(next.body), isCurrent });
+      }
+    } finally { modelDiagnosticFlights.delete(source.tab); }
+  })().catch(() => undefined);
+  return true;
 }
 
 async function currentConversationDocument(source, conversationId) {
@@ -4438,13 +4876,14 @@ const HANDLERS = {
     await load();
     closeWakeSocket();
     if (browserController) await (await browserController).revoke();
+    clearDesktopInputRetries();
     // Invalidate any `/pair` already on the wire before changing the visible/persisted state.
     connectionEpoch++;
     token = null;
     // Remembered, not just cleared. Otherwise the next request — two seconds away in any
     // open tab — provisions a new token and the browser is connected again.
     disconnected = true;
-    await activeTabs?.revoke().catch(() => undefined);
+    await renderingLeases(() => activeTabs?.revoke());
     pairingError = null;
     await persist();
     return { ok: true };
@@ -4460,20 +4899,7 @@ const HANDLERS = {
     // exact moment the user turns Overwrite on. Discover the same host allowlist used by
     // extension-reload recovery and union it with the durable registry. Host permissions in
     // manifest.json already authorize URL-filtered tabs.query on these origins.
-    let discovered = [];
-    try {
-      discovered = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
-    } catch {
-      discovered = [];
-    }
-    const tabs = [
-      ...new Set([
-        ...known,
-        ...discovered
-          .map((tab) => (tab && typeof tab.id === 'number' ? tab.id : NaN))
-          .filter((value) => Number.isInteger(value))
-      ])
-    ];
+    const tabs = await unionQueriedChatGptTabs(known);
     let applied = 0;
     for (const id of tabs) {
       try {
@@ -4992,19 +5418,28 @@ const HANDLERS = {
     } else if (message?.note === 'input-held' && ['page-moved', 'chat-moved-on', 'question-gone', 'still-answering', 'turn-held', 'tool-running', 'no-composer', 'composer-hidden', 'recovery-question-changed',
         'recovery-question-unreadable', 'recovery-not-ready'].includes(message.reason) &&
         typeof message.inputId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(message.inputId)) {
-      body = { note: 'input-held', reason: message.reason, inputId: message.inputId, conversationId };
+      // Only the question-changed hold names the question the page read, and when its document loaded (#2184).
+      const named = message.reason === 'recovery-question-changed' && typeof message.newestUser === 'string' &&
+        message.newestUser.length > 0 && message.newestUser.length <= 256 && !/[\u0000-\u001f\u007f]/.test(message.newestUser) &&
+        Number.isFinite(message.documentSince) && message.documentSince > 0;
+      body = { note: 'input-held', reason: message.reason, inputId: message.inputId, conversationId,
+        ...(named ? { newestUser: message.newestUser, documentSince: Math.floor(message.documentSince) } : {}) };
     }
     if (!body) return { ok: false };
     // Best effort, and never in the tab's queue: a claim or receipt behind it must not wait on a log line.
     void call('/page-note', { method: 'POST', body: JSON.stringify(body) }).catch(() => undefined);
     return { ok: true };
   },
-  async command_step(message) {
+  async command_step(message, _sender, source) {
     const id = typeof message.id === 'string' ? message.id.slice(0, 128) : '';
     const step = typeof message.step === 'string' ? message.step.slice(0, 32) : '';
     if (!id || !step) return { ok: false };
-    const result = await call('/commands/step', { method: 'POST',
-      body: JSON.stringify({ id, client: String(message.client || '').slice(0, 64), step }) });
+    const body = { id, client: String(message.client || '').slice(0, 64), step,
+      // The app validates the fixed diagnostic shape; old apps ignore this optional field.
+      ...(message.modelSelection && typeof message.modelSelection === 'object' && JSON.stringify(message.modelSelection).length <= 8192
+        ? { modelSelection: message.modelSelection } : {}) };
+    if (step === 'model-diagnostic') return { ok: queueModelDiagnostic(body, source) };
+    const result = await call('/commands/step', { method: 'POST', body: JSON.stringify(body) });
     return { ok: result.ok === true };
   },
   /** The marked page asking for the one command it was opened for. */
@@ -5144,6 +5579,7 @@ async function companionDiagnosticSnapshot(found) {
   const languageState = appLanguageState();
   return {
     capturedAt: Date.now(),
+    ...(closeOutboxDecision ? { closeOutboxDecision } : {}),
     language: { ...languageState, error: languageState.error ?? readFailed,
       stored: typeof preferences[APP_LANGUAGE_KEY] === 'string' ? preferences[APP_LANGUAGE_KEY] : null },
     status: {
@@ -5327,7 +5763,7 @@ chrome.tabs.onUpdated.addListener((id, changeInfo, tab) => {
       // minimized window for app-opened chats, 2026-10-15); a Send waiting there on its new
       // chat's address learns it now. Messages reach such a page at once; its timers do not.
       if (same) void tabReply(id, { type: 'clf-route-changed' }, { documentId }).catch(() => undefined);
-      await activeTabs?.navigation(id, same ? tab : null);
+      await renderingLeases(() => activeTabs?.navigation(id, same ? tab : null));
       if (rendering && same) return maintain(true);
     }).catch(() => undefined);
   }
@@ -5882,6 +6318,10 @@ async function restoreChatgptTab(id, current = () => true, documentId = null) {
     if (!current()) return false;
     // Rebuild the isolated-world DOM adapter before the recorder that consumes it.
     await chrome.scripting.executeScript({ target, files: ['chatgpt-dom.js'] });
+    if (!current()) return false;
+    // The app's colors for the CoS parts of the page, before content.js, as the manifest loads them
+    // (CodeRabbit on #2038): a restored tab otherwise keeps the defaults until it reloads.
+    await chrome.scripting.executeScript({ target, files: ['app-palette.js'] });
     if (!current()) return false;
     // Keep the React/Fiber reader in ChatGPT's own world, exactly like the static manifest
     // declaration. An older helper may still answer too; the nonce/version gate in

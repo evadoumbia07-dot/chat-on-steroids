@@ -14,6 +14,60 @@ interface Highlight { icon: string; title: () => string; text: () => string }
 interface Release { lead: () => string; highlights: Highlight[] }
 
 const RELEASES: Readonly<Record<string, Release>> = {
+  '2.1.55': {
+    lead: () => t("Restore a turn's edited files, manage Skills from their cards, free storage per chat, and safer saves after a crash."),
+    highlights: [
+      { icon: 'i-retry', title: () => t("Restore a turn"), text: () => t("Changed files can put a turn's edited files back, with Undo in Review.") },
+      { icon: 'i-skill', title: () => t("Manage installed Skills"), text: () => t("Pause, re-enable or reveal an installed Skill from its card menu.") },
+      { icon: 'i-chart', title: () => t("Free space per chat"), text: () => t("The storage dialog shows what one chat uses and frees its images or long texts.") },
+      { icon: 'i-lock', title: () => t("Safer after a crash"), text: () => t("Chat groups, settings imports and edit checkpoints stay consistent when a save or move is interrupted.") }
+    ]
+  },
+  '2.1.54': {
+    lead: () => t("Goal chats that don't stand idle, a tidier Settings, faster chat updates, and the files a chat edited."),
+    highlights: [
+      { icon: 'i-agents', title: () => t("Goal chats don't stand idle"), text: () => t("A Goal or Loop chat whose Compact & Resume got stuck goes on from its saved summary.") },
+      { icon: 'i-gear', title: () => t("A tidier Settings"), text: () => t("Agents settings are split into five short pages instead of one very long one.") },
+      { icon: 'i-retry', title: () => t("Chats update faster"), text: () => t("A new message or tool call shows up in the open chat much sooner.") },
+      { icon: 'i-git-diff', title: () => t("What a chat edited"), text: () => t("Review lists the files this chat changed and opens each recorded diff.") }
+    ]
+  },
+  '2.1.53': {
+    lead: () => t("Compact & Resume in Projects, Goal chats that recover, and safer saves over SSH."),
+    highlights: [
+      { icon: 'i-retry', title: () => t("Compact & Resume in Projects"), text: () => t("It works in a Project that already holds chats started through the app.") },
+      { icon: 'i-agents', title: () => t("Goal chats keep going"), text: () => t("A Goal chat no longer stops for good after a Continue that failed.") },
+      { icon: 'i-lock', title: () => t("Safer saves over SSH"), text: () => t("If a save fails, your original file stays as it was.") },
+      { icon: 'i-chat', title: () => t("Write mid-answer in any language"), text: () => t("A message sent while ChatGPT is answering now goes out on pages in every language.") }
+    ]
+  },
+  '2.1.52': {
+    lead: () => t("A list of your scheduled messages, and search through whole long chats."),
+    highlights: [
+      { icon: 'i-clock', title: () => t("Scheduled"), text: () => t("One list of every scheduled message, where you can pause, run or delete each.") },
+      { icon: 'i-search', title: () => t("Search whole chats"), text: () => t("Search now reads the whole history of very long chats.") },
+      { icon: 'i-retry', title: () => t("Compact & Resume holds up"), text: () => t("A page reload in a Project no longer makes it fail every time.") },
+      { icon: 'i-skill', title: () => t("Skills only when wanted"), text: () => t("A Skill is not chosen when you say not to use it.") }
+    ]
+  },
+  '2.1.51': {
+    lead: () => t("Steps for you, a limit on busy chats, and Telegram notifications."),
+    highlights: [
+      { icon: 'i-terminal', title: () => t("Steps for you"), text: () => t("When ChatGPT needs something only you can do, it hands you the step. You run it and mark it done.") },
+      { icon: 'i-agents', title: () => t("A limit on busy chats"), text: () => t("Choose how many chats may work at once. Your own messages always go out.") },
+      { icon: 'i-phone', title: () => t("Telegram notifications"), text: () => t("Link your own bot to get a message when a chat finishes or needs you, and stop or pause it from your phone.") },
+      { icon: 'i-stop', title: () => t("Stop works all the way"), text: () => t("After a Stop, a chat no longer stays busy, and your next message goes out.") }
+    ]
+  },
+  '2.1.50': {
+    lead: () => t("Move chats between projects, chats that keep going, and an extension that updates during long runs."),
+    highlights: [
+      { icon: 'i-folder', title: () => t("Move chats between projects"), text: () => t("Drag a chat onto a project, or use Move to project in its menu. Undo puts it back.") },
+      { icon: 'i-retry', title: () => t("Chats keep going"), text: () => t("When a chat's next step is not picked up, the app keeps trying, tells you, and offers Continue now.") },
+      { icon: 'i-plug', title: () => t("The extension updates itself"), text: () => t("It no longer waits for every long-running chat to finish first.") },
+      { icon: 'i-bolt', title: () => t("Big chats stay fast"), text: () => t("Very long chats no longer slow the app down.") }
+    ]
+  },
   '2.1.49': {
     lead: () => t("Long chats that get through ChatGPT's limits, pop-ups out of the way, and message times."),
     highlights: [

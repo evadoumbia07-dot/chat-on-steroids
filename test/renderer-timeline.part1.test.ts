@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { T0, boot, settle, settleHistoryFrame, summary, text, toolCall, waitFor, type Handoff, type InputEntry, type LocalProject, type SessionEvent, type SessionSummary } from './renderer-timeline.harness.js';
+import { T0, boot, closeDom, settle, settleHistoryFrame, summary, text, toolCall, waitFor, type Handoff, type InputEntry, type LocalProject, type SessionEvent, type SessionSummary } from './renderer-timeline.harness.js';
 
 vi.mock('../src/renderer/workspace-terminal.js', () => ({ createWorkspaceTerminal: () => ({
   update: vi.fn(), show: vi.fn(), hide: vi.fn(), hasTabs: () => false,
@@ -64,6 +64,48 @@ it('shows elapsed runtime and stops the owned background process from the dock',
   await settle();
   expect((w as any).api.stopProcess).toHaveBeenCalledWith(summary([]).id, 4101, 91);
   expect(row.hidden).toBe(true);
+});
+
+// CodeRabbit on #2052: Output appears only when the app offers it, and a repaint keeps its keyboard focus.
+it('offers Output only with agent output available, and keeps its focus across a repaint', async () => {
+  const { w, publishBackgroundProcesses } = await boot([]);
+  const row = { processId: 4111, incarnation: 92, command: 'npm run dev', startedAt: Date.now() - 30_000, tty: false };
+  const host = w.document.getElementById('backgroundExecStatus')!;
+  // An older preload without agent output: no Output button.
+  (w as any).api.agentOutputOpen = undefined;
+  await publishBackgroundProcesses([row]);
+  expect(host.querySelector('.background-exec-output')).toBeNull();
+  (w as any).api.agentOutputOpen = vi.fn(async () => ({ ok: true, data: true }));
+  await publishBackgroundProcesses([{ ...row, startedAt: row.startedAt - 1 }]);
+  const output = host.querySelector<HTMLButtonElement>('.background-exec-output')!;
+  expect(output).not.toBeNull();
+  output.focus();
+  await publishBackgroundProcesses([{ ...row, startedAt: row.startedAt - 2 }]);
+  const repainted = host.querySelector<HTMLButtonElement>('.background-exec-output')!;
+  // The same button stays, so a press that spans a repaint still lands (CodeRabbit on #2052).
+  expect(repainted).toBe(output);
+  expect(w.document.activeElement).toBe(repainted);
+});
+
+it('keeps each expanded row\'s Output button across a repaint while its process is the same', async () => {
+  const { w, publishBackgroundProcesses } = await boot([]);
+  (w as any).api.agentOutputOpen = vi.fn(async () => ({ ok: true, data: true }));
+  const startedAt = Date.now() - 45_000;
+  const rows = [
+    { processId: 4301, incarnation: 111, command: 'npm run watch', startedAt, tty: false },
+    { processId: 4302, incarnation: 112, command: 'node server.js', startedAt: startedAt + 5_000, tty: true }
+  ];
+  await publishBackgroundProcesses(rows);
+  w.document.getElementById('backgroundExecStatus')!.click();
+  const list = w.document.getElementById('backgroundExecList')!;
+  const before = [...list.querySelectorAll<HTMLButtonElement>('.background-exec-output')];
+  expect(before).toHaveLength(2);
+  // A repaint with the same processes keeps both buttons (CodeRabbit on #2052); a new incarnation gets a new one.
+  await publishBackgroundProcesses([rows[0]!, { ...rows[1]!, incarnation: 113 }]);
+  const after = [...list.querySelectorAll<HTMLButtonElement>('.background-exec-output')];
+  expect(after[0]).toBe(before[0]);
+  expect(after[1]).not.toBe(before[1]);
+  expect(after[1]!.dataset.process).toBe('4302:113');
 });
 
 it('expands multiple background processes and stops each one from its own row', async () => {
@@ -305,6 +347,170 @@ it('asks for the selected chat\'s background tab once per switch (#1249)', async
   expect(followed).toEqual([second.id, first.id]);
 });
 
+it('follows a newly sent chat when its first native conversation ID arrives, once', async () => {
+  const opening: SessionSummary = { ...summary([]), conversationId: null, chatIds: [],
+    origin: { kind: 'desktop', fromSessionId: null, agentId: null, task: '' } };
+  const sessions = [opening];
+  const { w, notifySession } = await boot([], false, [], [], { sessions });
+  const followed: string[] = [];
+  (w as any).api.followSessionTab = async (id: string) => { followed.push(id); return { ok: true, data: true }; };
+  w.document.querySelector<HTMLElement>(`#sessionList [data-id="${opening.id}"]`)!.click();
+  followed.length = 0; // The initial selection cannot follow a chat that has no provider ID yet.
+
+  sessions[0] = { ...opening, conversationId: 'new-native-chat', chatIds: ['new-native-chat'] };
+  notifySession(); await settle(550);
+  expect(followed).toEqual([opening.id]);
+  notifySession(); await settle(550);
+  expect(followed).toEqual([opening.id]);
+});
+
+it('follows the first binding even when project history merges it before the newest-page refresh', async () => {
+  const project: LocalProject = { id: '33333333-3333-4333-8333-333333333333', name: 'Project', path: '/repo', createdAt: T0 };
+  const opening: SessionSummary = { ...summary([]), projectId: project.id, conversationId: null, chatIds: [],
+    origin: { kind: 'desktop', fromSessionId: null, agentId: null, task: '' } };
+  const bound = { ...opening, conversationId: 'new-native-chat', chatIds: ['new-native-chat'] };
+  const { w, notifySession } = await boot([], false, [], [project], { sessions: [opening] });
+  const api = (w as any).api;
+  const followed: string[] = [];
+  api.followSessionTab = async (id: string) => { followed.push(id); return { ok: true, data: true }; };
+  w.document.querySelector<HTMLElement>('#sessionList [data-id="' + opening.id + '"]')!.click();
+  followed.length = 0;
+  let newestPage = opening;
+  api.listSessions = async (options: { projectId?: string }) => ({ ok: true, data: {
+    sessions: options?.projectId === project.id ? [bound] : [newestPage],
+    total: 1, nextCursor: null, activeId: null, pressure: [], blocked: [], approval: [], recoveryStopped: []
+  } });
+
+  const heading = w.document.querySelector<HTMLElement>('.project-group .project-heading')!;
+  // Selecting the chat already expands its project; close and reopen to request history.
+  heading.click(); heading.click();
+  await settle(300);
+  expect(followed).toEqual([opening.id]);
+  newestPage = bound;
+  notifySession(); await settle(550);
+  expect(followed).toEqual([opening.id]);
+  // A stale newest page may briefly show the old unbound summary again.
+  newestPage = opening;
+  notifySession(); await settle(550);
+  newestPage = bound;
+  notifySession(); await settle(550);
+  expect(followed).toEqual([opening.id]);
+});
+
+it('invalidates a queued browser follow when New Chat replaces the selected session', async () => {
+  const first = summary([]);
+  const { w } = await boot([], false, [], [], { sessions: [first] });
+  const followed: Array<string | null> = [];
+  (w as any).api.followSessionTab = async (id: string | null) => { followed.push(id); return { ok: true, data: true }; };
+  w.document.querySelector<HTMLElement>('#sessionList [data-id="' + first.id + '"]')!.click();
+  w.document.getElementById('newChat')!.click();
+  expect(followed).toEqual([first.id, null]);
+});
+
+it.each(['catalog removal', 'delete action'])('cancels an unbound chat follow after %s, even if its bound row is seen later', async removal => {
+  const opening: SessionSummary = { ...summary([]), conversationId: null, chatIds: [],
+    origin: { kind: 'desktop', fromSessionId: null, agentId: null, task: '' } };
+  const sessions = [opening];
+  const follow = vi.fn(async (_id: string | null) => ({ ok: true, data: false }));
+  const { w, notifySession } = await boot([], false, [], [], { sessions, followSessionTab: follow });
+  const selector = `#sessionList [data-id="${opening.id}"]`;
+  w.document.querySelector<HTMLElement>(selector)!.click();
+  if (removal === 'delete action') {
+    (w as any).api.deleteSession = async () => { sessions.splice(0); return { ok: true, data: true }; };
+    w.document.querySelector<HTMLElement>(`${selector} [data-row-menu]`)!.click();
+    w.document.querySelector<HTMLElement>('[data-row-action="remove"]')!.click();
+  } else {
+    sessions.splice(0);
+    notifySession();
+  }
+  await waitFor(() => expect(follow.mock.calls).toEqual([[opening.id], [null]]));
+  await waitFor(() => expect(w.document.querySelector(selector)).toBeNull());
+  sessions.push({ ...opening, title: 'Late bound row', conversationId: 'late-chat', chatIds: ['late-chat'] });
+  notifySession();
+  await waitFor(() => expect(w.document.querySelector(selector)?.textContent).toContain('Late bound row'));
+  expect(follow.mock.calls).toEqual([[opening.id], [null]]);
+});
+
+it('drops the unbound follow across a renderer restart with the previous window storage restored', async () => {
+  const opening: SessionSummary = { ...summary([]), conversationId: null, chatIds: [],
+    origin: { kind: 'desktop', fromSessionId: null, agentId: null, task: '' } };
+  const sessions = [opening];
+  const follow = vi.fn(async (_id: string | null) => ({ ok: true, data: false }));
+  const previous = await boot([], false, [], [], { sessions, followSessionTab: follow });
+  const selector = `#sessionList [data-id="${opening.id}"]`;
+  previous.w.document.querySelector<HTMLElement>(selector)!.click();
+  expect(follow.mock.calls).toEqual([[opening.id]]);
+  const storage = Object.fromEntries(Array.from({ length: previous.w.localStorage.length }, (_, i) => {
+    const key = previous.w.localStorage.key(i)!;
+    return [key, previous.w.localStorage.getItem(key)!];
+  }));
+  closeDom();
+  vi.resetModules();
+  const restarted = await boot([], false, [], [], { sessions, storage, followSessionTab: follow });
+  sessions[0] = { ...opening, title: 'Bound after restart', conversationId: 'late-chat', chatIds: ['late-chat'] };
+  restarted.notifySession();
+  await waitFor(() => expect(restarted.w.document.querySelector(selector)?.textContent).toContain('Bound after restart'));
+  expect(follow.mock.calls).toEqual([[opening.id]]);
+  // Only a fresh user selection in the new window authorizes another follow.
+  restarted.w.document.querySelector<HTMLElement>(selector)!.click();
+  expect(follow.mock.calls).toEqual([[opening.id], [opening.id]]);
+});
+
+it('does not focus a newly bound chat after the person has selected another one', async () => {
+  const opening: SessionSummary = { ...summary([]), conversationId: null, chatIds: [],
+    origin: { kind: 'desktop', fromSessionId: null, agentId: null, task: '' } };
+  const other: SessionSummary = { ...summary([]), id: '2026-09-02-test0002', title: 'Other chat' };
+  const sessions = [opening, other];
+  const { w, notifySession } = await boot([], false, [], [], { sessions });
+  const followed: string[] = [];
+  (w as any).api.followSessionTab = async (id: string) => { followed.push(id); return { ok: true, data: true }; };
+  const row = (id: string) => w.document.querySelector<HTMLElement>(`#sessionList [data-id="${id}"]`)!;
+  row(opening.id).click();
+  row(other.id).click();
+  followed.length = 0;
+
+  sessions[0] = { ...opening, conversationId: 'new-native-chat', chatIds: ['new-native-chat'] };
+  notifySession(); await settle(550);
+  expect(followed).toEqual([]);
+});
+
+it('keeps a first binding pending until main accepts it and retries on a catalog refresh', async () => {
+  const opening: SessionSummary = { ...summary([]), conversationId: null, chatIds: [],
+    origin: { kind: 'desktop', fromSessionId: null, agentId: null, task: '' } };
+  const rows = [opening];
+  const { w, notifySession } = await boot([], false, [], [], { sessions: rows });
+  const follow = vi.fn(async () => ({ ok: true, data: false }));
+  (w as any).api.followSessionTab = follow;
+  w.document.querySelector<HTMLElement>(`#sessionList [data-id="${opening.id}"]`)!.click();
+  rows[0] = { ...opening, conversationId: 'new-native-chat', chatIds: ['new-native-chat'] };
+  notifySession();
+  await waitFor(() => expect(follow).toHaveBeenCalledTimes(2));
+  follow.mockResolvedValue({ ok: true, data: true });
+  notifySession();
+  await waitFor(() => expect(follow).toHaveBeenCalledTimes(3));
+  notifySession(); await settle(550);
+  expect(follow).toHaveBeenCalledTimes(3);
+});
+
+it('does not let a delayed acknowledgement erase the newer selected chat follow', async () => {
+  const origin = { kind: 'desktop' as const, fromSessionId: null, agentId: null, task: '' };
+  const first = { ...summary([]), origin };
+  const second = { ...summary([]), id: '2026-09-02-test0002', origin };
+  const { w, notifySession } = await boot([], false, [], [], { sessions: [first, second] });
+  let release!: (value: { ok: true; data: boolean }) => void;
+  const follow = vi.fn()
+    .mockImplementationOnce(() => new Promise(resolve => { release = resolve; }))
+    .mockResolvedValue({ ok: true, data: false });
+  (w as any).api.followSessionTab = follow;
+  w.document.querySelector<HTMLElement>(`#sessionList [data-id="${first.id}"]`)!.click();
+  w.document.querySelector<HTMLElement>(`#sessionList [data-id="${second.id}"]`)!.click();
+  release({ ok: true, data: true });
+  await settle();
+  notifySession();
+  await waitFor(() => expect(follow).toHaveBeenCalledTimes(3));
+  expect(follow.mock.calls.map(([id]) => id)).toEqual([first.id, second.id, second.id]);
+});
+
 it('clears control projections on an existing-session switch and fences A to B to A responses', async () => {
   const first = summary([]), second = { ...summary([]), id: '2026-09-02-test0002', title: 'Other session' };
   const { w, append } = await boot([], true, [], [], { sessions: [first, second] });
@@ -333,7 +539,7 @@ it('clears control projections on an existing-session switch and fences A to B t
   expect(w.document.getElementById('recoveryStatus')!.hidden).toBe(true);
 });
 
-it('keeps the prior transcript inert until the selected detail arrives and fences A to B to A', async () => {
+it.each(['immediate', 'deferred'] as const)('keeps the prior transcript inert until the selected detail arrives and fences A to B to A (%s traces)', async traceResponse => {
   const attachment = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'a-only.png', mimeType: 'image/png', size: 42, preview: 'data:image/webp;base64,YQ==' };
   const aEvents: SessionEvent[] = [
     { seq: 1, time: T0, source: 'extension', kind: 'user_message', messageId: 'a-question', message: text('A QUESTION'), attachments: [attachment] },
@@ -400,16 +606,23 @@ it('keeps the prior transcript inert until the selected detail arrives and fence
   expect(timeline.hasAttribute('inert')).toBe(true);
   expect(w.document.getElementById('sessionControlStatus')!.textContent).toBe('');
 
+  // A detail read also awaits turn traces before painting. Defer that reply past the old
+  // timer-only settle boundary so the test must wait for the resulting UI, not elapsed ticks.
+  api.turnTraces = vi.fn(async () => {
+    if (traceResponse === 'deferred') await settle();
+    return { ok: true, data: {} };
+  });
   const current: SessionEvent[] = [{ seq: 3, time: T0 + 3, source: 'extension', kind: 'assistant_message', messageId: 'a-current', message: text('CURRENT A ANSWER'), state: 'final', final: true }];
   details[2]!.reply(detail(first, current));
   controls[2]!.reply({ ok: true, data: { automation: 'off', objective: '', blocked: '', job: null, recovery: [] } });
-  await settle();
-  expect(timeline.textContent).toContain('CURRENT A ANSWER');
-  expect(timeline.textContent).not.toContain('STALE A QUESTION');
-  expect(timeline.querySelector('img[alt="a-only.png"]')).toBeNull();
-  expect(timeline.hasAttribute('inert')).toBe(false);
-  expect(timeline.hasAttribute('aria-busy')).toBe(false);
-  expect(w.document.getElementById('timelineEmpty')!.hidden).toBe(true);
+  await waitFor(() => {
+    expect(timeline.textContent).toContain('CURRENT A ANSWER');
+    expect(timeline.textContent).not.toContain('STALE A QUESTION');
+    expect(timeline.querySelector('img[alt="a-only.png"]')).toBeNull();
+    expect(timeline.hasAttribute('inert')).toBe(false);
+    expect(timeline.hasAttribute('aria-busy')).toBe(false);
+    expect(w.document.getElementById('timelineEmpty')!.hidden).toBe(true);
+  });
 });
 
 it.each(['failed', 'empty', 'new-chat'] as const)('retires retained rows after a %s destination without a welcome flash', async outcome => {
@@ -609,6 +822,26 @@ it('keeps the scheduled label on the sent message in the chat', async () => {
   expect(labels()).toEqual(['Scheduled', null]);
   await append([{ ...sent, seq: 3, origin: 1, scheduled: { dueAt, late: true } }]);
   expect(labels()).toEqual([`Scheduled · late, was due ${new Date(dueAt).toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' })}`, null]);
+});
+
+// Haz on #1990: a reply from Telegram says so in the chat, in the scheduled label's style, while it
+// waits and once sent, so the person can check what happened remotely.
+it('marks a message from Telegram in the queue and in the chat', async () => {
+  const sent: SessionEvent = { kind: 'user_message', seq: 1, origin: 1, time: T0, source: 'app', messageId: 'telegram-sent', inputId: 'telegram-run',
+    message: text('Run the tests'), via: 'telegram' };
+  const typed: SessionEvent = { kind: 'user_message', seq: 2, origin: 2, time: T0 + 1, source: 'app', messageId: 'typed-2', message: text('And this?') };
+  const { w, live, append } = await boot([sent, typed]);
+  const labels = () => [...w.document.querySelectorAll('.said.is-user')].map(bubble => bubble.querySelector('.said-origin')?.textContent ?? null);
+  expect(labels()).toEqual(['From Telegram', null]);
+  const queued = { id: 'telegram-queued', sessionId: summary(live.events).id, text: 'Then deploy', mode: 'auto', dueAt: 0, model: null,
+    reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-a', via: 'telegram' } as InputEntry;
+  live.inputs.push(queued);
+  await append([]);
+  await waitFor(() => expect(w.document.querySelector('#inputQueue [data-input-id="telegram-queued"] .pending-message-origin')?.textContent).toBe('From Telegram'));
+  // Waiting for a running turn, its task card carries the same words.
+  live.inputs[0] = { ...queued, mode: 'after-turn' };
+  await append([]);
+  await waitFor(() => expect(w.document.querySelector('#finishQueue [data-input-id="telegram-queued"] .queue-label')?.textContent).toBe('From Telegram · Then deploy'));
 });
 
 // #1402: the app's own fresh-turn continue is no one's typed message. Waiting, it shows as the
@@ -966,6 +1199,61 @@ it('says when the send check holds an automatic message, with its reason', async
   expect(w.document.querySelector('#inputQueue .pending-message')?.textContent ?? '').not.toContain('Held');
 });
 
+// 2026-11-03 (Mac): the chat's page had the person's Continue and held it while ChatGPT still answered.
+it('says a queued message waits for ChatGPT\'s answer while the chat\'s page holds it, and stops saying so once that is old', async () => {
+  // A frozen clock: a slow runner can never let a hold lapse before its wording is checked (CodeRabbit on #2054).
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date(2026, 10, 3, 15, 0));
+  try {
+    const asked = Date.now() - 12_000;
+    const { w, live, append } = await boot([
+      { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'held-turn' },
+      { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'held-turn', messageId: 'q-now', message: text('Run the tests') }
+    ]);
+    const api = (w as any).api;
+    const chat = await import('../src/renderer/chat.js');
+    const state = (await api.getState()).data;
+    chat.chatApply({ ...state, bridge: { ...state.bridge, present: true } });
+    const queued: InputEntry = { id: 'held-one', sessionId: summary(live.events).id, state: 'queued', owner: null, text: 'Continue',
+      mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-a',
+      pageHold: { reason: 'still-answering', at: Date.now() - 2_000 } };
+    const status = () => w.document.querySelector('#inputQueue .pending-message')?.textContent ?? '';
+    // Each change is announced the way main does, then the queue's own refresh is waited for (CodeRabbit on #2054).
+    const shows = async (expected: string | null, absent?: string) => {
+      await append([]);
+      await waitFor(() => {
+        if (expected) expect(status()).toContain(expected);
+        if (absent) expect(status()).not.toContain(absent);
+      });
+    };
+    live.inputs.push(queued);
+    await shows('Waiting for ChatGPT to finish its answer');
+    live.inputs[0] = { ...queued, pageHold: { reason: 'turn-held', at: Date.now() - 2_000 } };
+    await shows("Waiting for ChatGPT's page to end its turn");
+    live.inputs[0] = { ...queued, pageHold: { reason: 'tool-running', at: Date.now() - 2_000 } };
+    await shows('Waiting for the running tool call to finish');
+    // A hold no page repeats lapses after 75 s by itself, with no queue refresh to repaint it (CodeRabbit on #2054).
+    live.inputs[0] = { ...queued, pageHold: { reason: 'still-answering', at: Date.now() - 73_500 } };
+    await shows('Waiting for ChatGPT to finish its answer');
+    const button = w.document.querySelector<HTMLButtonElement>('#inputQueue .pending-message button')!;
+    const control = [button.className, button.getAttribute('aria-label')];
+    button.focus();
+    // Only now does the hold grow past 75 s; the lapse timer repaints by itself.
+    vi.setSystemTime(Date.now() + 2_000);
+    await waitFor(() => expect(status()).not.toContain('Waiting for ChatGPT'), { timeout: 5_000 });
+    // The rebuilt row's same control keeps the keyboard focus.
+    const focused = w.document.activeElement as HTMLElement;
+    expect(focused.closest('.pending-message')).not.toBeNull();
+    expect([focused.className, focused.getAttribute('aria-label')]).toEqual(control);
+    // The message fails while its Cancel has focus: the failed row's own first control takes it, not the page.
+    live.inputs[0] = { ...queued, pageHold: undefined, state: 'failed', error: 'Not sent: the browser did not pick up this message within 60 seconds.' };
+    await shows('Not sent');
+    const after = w.document.activeElement as HTMLElement;
+    expect(after.tagName).toBe('BUTTON');
+    expect(after.closest('.pending-message')).not.toBeNull();
+  } finally { vi.useRealTimers(); }
+});
+
 it('says why a queued message waits: no extension, or a running tool call', async () => {
   const asked = Date.now() - 12_000;
   const { w, live, append } = await boot([
@@ -1022,6 +1310,366 @@ it.each([false, true])('hands a delivered bubble to exact native history without
   await append(historyFirst ? [] : [message]);
   expect(count()).toBe(1);
   expect(w.document.querySelector('#inputQueue .pending-message')).toBeNull();
+});
+
+it('hands a delivered bubble, Cancel control, and focus to an early page echo without duplicating before or after /input/ack arrives', async () => {
+  const { w, live, append } = await boot([], true, [], [], { summary: { chatIds: ['chat-b'] } });
+  (w as any).api.getSessionControls = (id: string) => Promise.resolve({
+    ok: true as const,
+    data: { sessionId: id, conversationId: 'chat-b', automation: 'off', activeTurnId: null, finishHeld: false, blocked: '', job: null }
+  });
+  const row: InputEntry = { id: 'delivery-echo', sessionId: summary([]).id, state: 'browser', owner: 'page', text: 'Follow-up once',
+    mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-b' };
+  live.inputs.push(row);
+  await append([]);
+  const pendingCancel = w.document.querySelector<HTMLButtonElement>('#inputQueue .pending-message button');
+  expect(pendingCancel).not.toBeNull();
+  pendingCancel!.focus();
+  expect(w.document.activeElement).toBe(pendingCancel);
+  expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Cancel delivery');
+
+  // Extension DOM scan reports the user_message first, without inputId, while outbox is still state: 'browser'.
+  const echo: SessionEvent = { seq: 1, time: T0 + 1, source: 'extension', kind: 'user_message',
+    messageId: 'native-echo-1', message: text(row.text) };
+  await append([echo]);
+  const count = () => [...w.document.querySelectorAll('#timeline .said.is-user, #inputQueue .pending-message')].filter(node => node.textContent?.includes(row.text)).length;
+  expect(count()).toBe(1);
+  expect(w.document.querySelector('#inputQueue .pending-message')).toBeNull();
+  expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Send message');
+  expect(w.document.activeElement).toBe(w.document.getElementById('chatInput'));
+
+  // A subsequent question arriving before /input/ack must not resurrect a duplicate for the already-matched prompt.
+  await append([{ seq: 2, time: T0 + 2, source: 'extension', kind: 'user_message',
+    messageId: 'native-next-2', message: text('Second question') }]);
+  expect(count()).toBe(1);
+  expect(w.document.querySelector('#inputQueue .pending-message')).toBeNull();
+
+  // Later /input/ack commits the confirmed revision at a new sequence >= cursor.
+  live.inputs[0] = { ...row, state: 'sent', messageId: 'native-echo-1', historyAnchored: true, deliveredAt: T0 + 1 };
+  await append([{ ...echo, seq: 3, inputId: row.id, inputDelivery: 'confirmed' }]);
+  expect(count()).toBe(1);
+  expect(w.document.querySelector('#inputQueue .pending-message')).toBeNull();
+  expect(w.document.querySelector('#timeline .said.is-user [aria-label="Delivery confirmed"]')).not.toBeNull();
+});
+
+it.each(['images', 'attachments'] as const)('keeps media pending bubble visible (%s) until an echo carries attachments or /input/ack arrives', async kind => {
+  const { w, live, append } = await boot([], true, [], [], { summary: { chatIds: ['chat-b'] } });
+  const row: InputEntry = {
+    id: `delivery-${kind}`,
+    sessionId: summary([]).id,
+    state: 'browser',
+    owner: 'page',
+    text: `Look at this ${kind}`,
+    ...(kind === 'images'
+      ? { images: [{ name: 'shot.png', dataUrl: 'data:image/png;base64,AA==' }] }
+      : { attachments: [{ id: 'doc-1', name: 'spec.pdf', mimeType: 'application/pdf', size: 120 }] }),
+    mode: 'auto',
+    model: null,
+    reasoningEffort: null,
+    dueAt: T0,
+    createdAt: T0,
+    conversationId: 'chat-b'
+  };
+  live.inputs.push(row);
+  await append([]);
+  expect(w.document.querySelector(kind === 'images' ? '#inputQueue .pending-message img' : '#inputQueue .pending-message .message-attachments')).not.toBeNull();
+
+  // Early echo without attachments/assets must keep the pending media card visible.
+  const echo: SessionEvent = { seq: 1, time: T0 + 1, source: 'extension', kind: 'user_message',
+    messageId: `native-${kind}-1`, message: text(row.text) };
+  await append([echo]);
+  expect(w.document.querySelector('#inputQueue .pending-message')).not.toBeNull();
+
+  // Once an echo revision includes attachment metadata, the pending card retires cleanly.
+  await append([{ ...echo, seq: 2, attachments: [{ id: 'att-1', name: kind === 'images' ? 'shot.png' : 'spec.pdf', mimeType: kind === 'images' ? 'image/png' : 'application/pdf', size: 2 }] }]);
+  expect(w.document.querySelector('#inputQueue .pending-message')).toBeNull();
+  expect(w.document.querySelector('#timeline .said.is-user .message-attachments')).not.toBeNull();
+});
+
+it('syncs a delivered bubble and delivery controls only after the replacement bubble mounts on the fast active-detail path', async () => {
+  const { w, live, append, notifySession } = await boot([], true, [], [], { summary: { chatIds: ['chat-b'] } });
+  (w as any).api.getSessionControls = (id: string) => Promise.resolve({
+    ok: true as const,
+    data: { sessionId: id, conversationId: 'chat-b', automation: 'off', activeTurnId: null, finishHeld: false, blocked: '', job: null }
+  });
+  let releaseTraces: (() => void) | null = null;
+  let holdTraces = false;
+  (w as any).api.turnTraces = () => {
+    if (!holdTraces) return Promise.resolve({ ok: true as const, data: {} });
+    holdTraces = false;
+    return new Promise(resolve => { releaseTraces = () => resolve({ ok: true as const, data: {} }); });
+  };
+
+  const row: InputEntry = { id: 'delivery-fast', sessionId: summary([]).id, state: 'browser', owner: 'page', text: 'Fast path sync',
+    mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-b' };
+  live.inputs.push(row);
+  await append([]);
+  expect(w.document.querySelector('#inputQueue .pending-message')).not.toBeNull();
+  expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Cancel delivery');
+
+  // Keep the 400 ms catalog listSessions() refresh held so only loadDetail()'s fast path drives updates.
+  let releaseList!: () => void;
+  const listCalls = { sessions: 0, inputs: 0 };
+  const origListSessions = (w as any).api.listSessions;
+  const origListInputs = (w as any).api.listInputs;
+  (w as any).api.listSessions = (...args: any[]) => {
+    listCalls.sessions += 1;
+    return new Promise(resolve => {
+      releaseList = () => resolve(origListSessions(...args));
+    });
+  };
+  (w as any).api.listInputs = (...args: any[]) => {
+    listCalls.inputs += 1;
+    return origListInputs(...args);
+  };
+
+  holdTraces = true;
+  live.events.push({ seq: 1, time: T0 + 1, source: 'extension', kind: 'user_message',
+    messageId: 'native-fast', message: text(row.text) });
+  notifySession();
+  await waitFor(() => expect(releaseTraces).not.toBeNull());
+  // While turnTraces is still in flight and the echo bubble has not mounted yet, Cancel delivery must stay available.
+  expect(w.document.querySelectorAll('#timeline .said.is-user')).toHaveLength(0);
+  expect(w.document.querySelector('#inputQueue .pending-message')).not.toBeNull();
+  expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Cancel delivery');
+
+  live.inputs[0] = { ...row, state: 'sent', messageId: 'native-fast', historyAnchored: true, deliveredAt: T0 + 1 };
+  releaseTraces!();
+  await waitFor(() => {
+    expect(w.document.querySelectorAll('#timeline .said.is-user')).toHaveLength(1);
+    expect(listCalls.inputs).toBeGreaterThanOrEqual(1);
+  });
+  const count = [...w.document.querySelectorAll('#timeline .said.is-user, #inputQueue .pending-message')].filter(node => node.textContent?.includes(row.text)).length;
+  expect(count).toBe(1);
+  expect(w.document.querySelector('#inputQueue .pending-message')).toBeNull();
+  expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Send message');
+  if (releaseList) releaseList();
+});
+
+it('never hides an unsent pending bubble behind a prior turn with identical text', async () => {
+  const { w, live, append } = await boot([
+    { seq: 1, time: T0 - 10, source: 'extension', kind: 'user_message', messageId: 'prior-q', message: text('Repeat prompt') }
+  ], true, [], [], { summary: { chatIds: ['chat-b'] } });
+  live.inputs.push({ id: 'unsent-prior', sessionId: summary([]).id, owner: 'page', mode: 'auto', model: null, reasoningEffort: null,
+    conversationId: 'chat-b', state: 'browser', text: 'Repeat prompt', dueAt: T0, createdAt: T0 });
+  await append([]);
+  expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual(['unsent-prior']);
+});
+
+it('never hides an unsent pending bubble behind a turn that ended before authorization', async () => {
+  const { w, live, append } = await boot([
+    { seq: 1, time: T0 + 5, source: 'extension', kind: 'user_message', messageId: 'mid-q', message: text('Later ended prompt') },
+    { seq: 2, time: T0 + 8, source: 'extension', kind: 'turn_end', turnId: 'mid-turn', outcome: 'completed' }
+  ], true, [], [], { summary: { chatIds: ['chat-b'] } });
+  live.inputs.push({ id: 'unsent-turn-ended', sessionId: summary([]).id, owner: 'page', mode: 'auto', model: null, reasoningEffort: null,
+    conversationId: 'chat-b', state: 'browser', text: 'Later ended prompt', dueAt: T0, createdAt: T0, sendAuthorizedAt: T0 + 10 });
+  await append([]);
+  expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual(['unsent-turn-ended']);
+});
+
+it('never hides a pending edit behind the existing target message being edited', async () => {
+  const targetId = '11111111-1111-4111-8111-111111111111';
+  const { w, live, append } = await boot([
+    { seq: 1, time: T0 + 20, source: 'extension', kind: 'user_message', messageId: targetId, message: text('Edit target prompt') }
+  ], true, [], [], { summary: { chatIds: ['chat-b'] } });
+  live.inputs.push({ id: 'unsent-edit', sessionId: summary([]).id, owner: 'page', mode: 'auto', model: null, reasoningEffort: null,
+    conversationId: 'chat-b', state: 'browser', text: 'Edit target prompt', dueAt: T0 + 15, createdAt: T0 + 15, edit: { messageId: targetId } });
+  await append([]);
+  expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual(['unsent-edit']);
+});
+
+it('never hides unauthorized browser claims, multi-conversation resumed sessions, or held/excluded queued inputs behind echoes', async () => {
+  const future = Date.now() + 60_000;
+  const now = Date.now();
+  const { w, live, append } = await boot([
+    { seq: 1, time: T0 + 25, source: 'extension', kind: 'user_message', messageId: 'latest-other', message: text('Something else') }
+  ], true, [], [], { summary: { chatIds: ['chat-b'] } });
+  const { chatApply } = await import('../src/renderer/chat.js');
+  const baseState = (await (w as any).api.getState()).data;
+  chatApply({
+    ...baseState,
+    bridge: { ...baseState.bridge, running: true, paired: true, present: true },
+    status: { ...baseState.status, routeSettlingUntil: 0 }
+  });
+  const base = { sessionId: summary([]).id, owner: null, mode: 'auto' as const, model: null, reasoningEffort: null,
+    conversationId: 'chat-b', text: 'Something else', createdAt: T0 + 20 };
+  live.inputs.push(
+    { ...base, id: 'browser-unauth', owner: 'page', state: 'browser', dueAt: T0 + 20, requiresAuthorization: true },
+    { ...base, id: 'browser-preauth-echo', owner: 'page', state: 'browser', dueAt: T0 + 20, requiresAuthorization: true, sendAuthorizedAt: T0 + 30 },
+    { ...base, id: 'queued-unclaimed-due', state: 'queued', dueAt: T0 + 20 },
+    { ...base, id: 'held-scheduled', state: 'queued', dueAt: T0 + 20, offeredAt: T0 + 21, scheduled: { scheduleId: 'sched-1', dueAt: T0 + 20, late: false } },
+    { ...base, id: 'held-unclaimed-due', state: 'queued', dueAt: T0 + 20, slotWait: 'slots' },
+    { ...base, id: 'held-pagehold', state: 'queued', dueAt: T0 + 20, offeredAt: T0 + 21, pageHold: { reason: 'still-answering', at: now } },
+    { ...base, id: 'held-sendcheck', state: 'queued', dueAt: T0 + 20, sendCheck: { attempt: 1, nextAt: future, reason: 'budget', answered: true } },
+    { ...base, id: 'held-future', state: 'queued', dueAt: future },
+    { ...base, id: 'held-error', state: 'queued', dueAt: T0 + 20, error: 'Waiting for browser' }
+  );
+  await append([]);
+  expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toContain('queued-unclaimed-due');
+  expect(w.document.querySelector('#inputQueue [data-input-id="held-pagehold"]')!.textContent).toContain('Waiting for ChatGPT to finish its answer');
+
+  // Enable routeSettlingUntil alongside a routeHeld entry; it also remains visible and unanchored.
+  chatApply({
+    ...baseState,
+    bridge: { ...baseState.bridge, running: true, paired: true, present: true },
+    status: { ...baseState.status, routeSettlingUntil: future }
+  });
+  live.inputs.splice(3, 0, { ...base, id: 'held-route', state: 'queued', dueAt: T0 + 20, offeredAt: T0 + 21 });
+  await append([]);
+  expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual([
+    'browser-unauth',
+    'browser-preauth-echo',
+    'queued-unclaimed-due',
+    'held-route',
+    'held-scheduled',
+    'held-unclaimed-due',
+    'held-pagehold',
+    'held-sendcheck',
+    'held-future',
+    'held-error'
+  ]);
+});
+
+it('never matches an unattributed or cross-conversation echo on a multi-chat session, but anchors same-conversation echoes on rotated chats', async () => {
+  const { w, live, append } = await boot([
+    { seq: 1, time: T0 + 1, source: 'extension', kind: 'user_message', messageId: 'unattributed-echo', message: text('Resumed chat prompt') }
+  ], true, [], [], { summary: { conversationId: 'chat-b', chatIds: ['chat-a', 'chat-b'] } });
+  live.inputs.push({ id: 'resumed-pending', sessionId: summary([]).id, state: 'browser', owner: 'page',
+    text: 'Resumed chat prompt', mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-b' });
+  await append([]);
+  expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual(['resumed-pending']);
+
+  // A cross-conversation echo from an older rotated chat must also remain unanchored.
+  await append([{ seq: 2, time: T0 + 2, source: 'extension', kind: 'user_message', messageId: 'old-tab-echo', conversationId: 'chat-a', message: text('Resumed chat prompt') }]);
+  expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual(['resumed-pending']);
+
+  // Rotated/compacted session (`chatIds.length > 1`): once the active conversation emits its own attributed echo, it anchors cleanly.
+  await append([{ seq: 3, time: T0 + 3, source: 'extension', kind: 'user_message', messageId: 'active-tab-echo', conversationId: 'chat-b', message: text('Resumed chat prompt') }]);
+  expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')]).toHaveLength(0);
+});
+
+it.each(['chat-a', undefined] as const)('scopes later-question echo check on multi-chat sessions (later conversationId=%s)', async laterConversation => {
+  const { w, live, append } = await boot([
+    { seq: 1, time: T0 + 1, source: 'extension', kind: 'user_message', messageId: 'active-echo', conversationId: 'chat-b', message: text('Rotated follow-up') },
+    { seq: 2, time: T0 + 2, source: 'extension', kind: 'user_message', messageId: 'later-question',
+      ...(laterConversation ? { conversationId: laterConversation } : {}), message: text('Later other question') }
+  ], true, [], [], { summary: { conversationId: 'chat-b', chatIds: ['chat-a', 'chat-b'] } });
+  live.inputs.push({ id: 'pending-rotated', sessionId: summary([]).id, state: 'browser', owner: 'page',
+    text: 'Rotated follow-up', mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-b' });
+  await append([]);
+  const ids = [...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId);
+  expect(ids).toEqual(laterConversation === 'chat-a' ? [] : ['pending-rotated']);
+});
+
+it('ignores a revision of an older question when choosing the latest echo', async () => {
+  const { w, live, append } = await boot([
+    { seq: 3, origin: 1, time: T0 - 10, source: 'extension', kind: 'user_message', messageId: 'older-revised', conversationId: 'chat-b', message: text('Older question') },
+    { seq: 2, origin: 2, time: T0 + 1, source: 'extension', kind: 'user_message', messageId: 'newer-echo', conversationId: 'chat-b', message: text('New follow-up') }
+  ], true, [], [], { summary: { conversationId: 'chat-b', chatIds: ['chat-b'] } });
+  live.inputs.push({ id: 'pending-origin', sessionId: summary([]).id, state: 'browser', owner: 'page',
+    text: 'New follow-up', mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-b' });
+  await append([]);
+  expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')]).toHaveLength(0);
+});
+
+it('checks unfiltered paintedDetailEvents for later questions when an agent filter hides them', async () => {
+  const { w, live, append } = await boot([
+    { seq: 1, time: T0 + 1, source: 'extension', kind: 'user_message', agent: 'prime', messageId: 'prime-old', conversationId: 'chat-b', message: text('Filtered prompt') },
+    { seq: 2, time: T0 + 2, source: 'extension', kind: 'user_message', messageId: 'later-unattributed', message: text('Unattributed newer question') }
+  ], true, [], [], { developerMode: true, summary: { conversationId: 'chat-b', chatIds: ['chat-b'] } });
+  w.document.querySelector<HTMLButtonElement>('#chatAgentFilter [data-agent="prime"]')!.click();
+  await settle();
+  live.inputs.push({ id: 'filtered-pending', sessionId: summary([]).id, state: 'browser', owner: 'page',
+    text: 'Filtered prompt', mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-b' });
+  await append([]);
+  expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual(['filtered-pending']);
+});
+
+it.each([-5, 2] as const)('exempts only older retried synthetic tool-input receipts (%ims) from blocking a matching native echo', async toolDelta => {
+  const { w, live, append } = await boot([], true, [], [], { summary: { conversationId: 'chat-b', chatIds: ['chat-b'] } });
+  live.inputs.push({ id: 'pending-browser', sessionId: summary([]).id, state: 'browser', owner: 'page',
+    text: 'Browser follow-up', mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-b' });
+  await append([]);
+  await waitFor(() => expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual(['pending-browser']));
+  await append([
+    { seq: 1, time: T0 + 1, source: 'extension', kind: 'user_message', messageId: 'native-echo', conversationId: 'chat-b', message: text('Browser follow-up') },
+    { seq: 2, time: T0 + toolDelta, source: 'app', kind: 'user_message', messageId: 'input:tool-a', inputId: 'tool-a', inputDelivery: 'confirmed', message: text('Tool receipt') }
+  ]);
+  await waitFor(() => expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId))
+    .toEqual(toolDelta < 1 ? [] : ['pending-browser']));
+});
+
+it('keeps echo exclusivity, cross-chat and history-page cache isolation, and Cancel delivery binding across races', async () => {
+  const firstSession = { ...summary([]), id: '2026-09-30-aaaaaaaa', title: 'Session A', conversationId: 'chat-a', chatIds: ['chat-a'] };
+  const secondSession = { ...summary([]), id: '2026-09-30-bbbbbbbb', title: 'Session B', conversationId: 'chat-b', chatIds: ['chat-b'] };
+  const rowsA: SessionEvent[] = [];
+  const rowsB: SessionEvent[] = [{ seq: 1, time: T0, source: 'extension', kind: 'assistant_message', messageId: 'b-asst', message: text('Session B ready'), state: 'final', final: true }];
+  const { w, live, notifySession } = await boot([], true, [], [], { sessions: [firstSession, secondSession] });
+  const api = (w as any).api;
+  let releaseClickControls: (() => void) | null = null;
+  let deferNextControlsRead = false;
+  const cancelledIds: string[] = [];
+  api.cancelInput = vi.fn((id: string) => { cancelledIds.push(id); return Promise.resolve({ ok: true as const, data: true }); });
+  api.getSessionControls = (id: string) => {
+    const reply = { ok: true as const, data: { sessionId: id, conversationId: id === firstSession.id ? 'chat-a' : 'chat-b', automation: 'off', activeTurnId: null, finishHeld: false, blocked: '', job: null } };
+    if (!deferNextControlsRead) return Promise.resolve(reply);
+    deferNextControlsRead = false;
+    return new Promise(resolve => { releaseClickControls = () => resolve(reply); });
+  };
+  api.getSession = (id: string, opts?: { from?: number; before?: number }) => {
+    const src = id === firstSession.id ? rowsA : rowsB;
+    if (opts?.before !== undefined) {
+      return Promise.resolve({ ok: true as const, data: { summary: firstSession, events: [], total: src.length, nextFrom: 0 } });
+    }
+    const from = opts?.from ?? 0;
+    const list = src.filter(event => event.seq >= from);
+    return Promise.resolve({ ok: true as const, data: { summary: id === firstSession.id ? firstSession : secondSession, events: list, total: src.length, nextFrom: list.reduce((m, e) => Math.max(m, e.seq + 1), from) } });
+  };
+
+  // Two distinct browser inputs with identical text: one echo retires only the first, never both.
+  live.inputs.push(
+    { id: 'dup-first', sessionId: firstSession.id, state: 'browser', owner: 'page', text: 'Same text', mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-a' },
+    { id: 'dup-second', sessionId: firstSession.id, state: 'browser', owner: 'page', text: 'Same text', mode: 'auto', model: null, reasoningEffort: null, dueAt: T0 + 1, createdAt: T0 + 1, conversationId: 'chat-a' }
+  );
+  rowsA.push({ seq: 1, time: T0 + 2, source: 'extension', kind: 'user_message', messageId: 'native-same-1', message: text('Same text') });
+  notifySession();
+  await waitFor(() => expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual(['dup-second']));
+
+  // A subsequent question arrives on A; switching to B and back to A must preserve A's cached match.
+  rowsA.push({ seq: 2, time: T0 + 3, source: 'extension', kind: 'user_message', messageId: 'native-later-a', message: text('Later prompt in A') });
+  notifySession();
+  await waitFor(() => expect(w.document.querySelectorAll('#timeline .said.is-user')).toHaveLength(2));
+  (w.document.querySelector(`#sessionList [data-id="${secondSession.id}"]`) as HTMLElement).click();
+  await waitFor(() => expect(w.document.getElementById('timeline')!.textContent).toContain('Session B ready'));
+  (w.document.querySelector(`#sessionList [data-id="${firstSession.id}"]`) as HTMLElement).click();
+  await waitFor(() => expect(w.document.getElementById('timeline')!.textContent).toContain('Later prompt in A'));
+  expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual(['dup-second']);
+
+  // Clicking Cancel delivery on dup-second while dup-second gets echoed mid-controls-refresh must not cancel a queued fallback row.
+  live.inputs.push({ id: 'queued-fallback', sessionId: firstSession.id, state: 'queued', owner: null, text: 'Queued next', mode: 'auto', model: null, reasoningEffort: null, dueAt: T0 + 10, createdAt: T0 + 10, conversationId: 'chat-a' });
+  notifySession();
+  await waitFor(() => expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Cancel delivery'));
+  deferNextControlsRead = true;
+  w.document.getElementById('chatSend')!.click();
+  await waitFor(() => expect(releaseClickControls).not.toBeNull());
+  rowsA.push({ seq: 3, time: T0 + 5, source: 'extension', kind: 'user_message', messageId: 'native-same-2', message: text('Same text') });
+  notifySession();
+  await waitFor(() => expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual(['queued-fallback']));
+  (releaseClickControls as (() => void) | null)!();
+  await settle();
+  expect(cancelledIds).toEqual([]);
+
+  // Clicking Cancel delivery on queued-fallback while another pending input moves ahead of it still cancels queued-fallback directly.
+  await waitFor(() => expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Cancel delivery'));
+  deferNextControlsRead = true;
+  releaseClickControls = null;
+  w.document.getElementById('chatSend')!.click();
+  await waitFor(() => expect(releaseClickControls).not.toBeNull());
+  live.inputs.unshift({ id: 'front-runner', sessionId: firstSession.id, state: 'queued', owner: null, text: 'Prepended earlier', mode: 'auto', model: null, reasoningEffort: null, dueAt: T0 + 9, createdAt: T0 + 9, conversationId: 'chat-a' });
+  notifySession();
+  await waitFor(() => expect([...w.document.querySelectorAll<HTMLElement>('#inputQueue .pending-message')].map(n => n.dataset.inputId)).toEqual(['front-runner', 'queued-fallback']));
+  (releaseClickControls as (() => void) | null)!();
+  await waitFor(() => expect(cancelledIds).toEqual(['queued-fallback']));
 });
 
 it.each([undefined, 4])('never resurrects committed off-page inputs beside genuinely waiting inputs when old timestamps reappear (historySeq=%s)', async historySeq => {
@@ -1129,6 +1777,7 @@ it('keeps generated-image metadata visible when recording storage is full', asyn
 });
 
 it.each([
+  ['session_quota', 'this chat reached its 192 MB storage limit', true],
   ['oversized', 'exceeds the recording limit', false],
   ['not_loaded', 'Image preview unavailable', false],
   ['removed', 'removed from local storage', true]
@@ -1197,19 +1846,49 @@ it.each(['image', 'txt', 'mixed', 'new-chat', 'after-turn'])('routes the compose
   expect(app.live.sent[0]!.attachmentDelivery).toBe(kind === 'image' ? 'tool' : undefined);
 });
 
+it('publishes attachment references from other drafts until their files are removed', async () => {
+  const first = summary([]);
+  const second = { ...first, id: 'other-session', title: 'Other chat', conversationId: 'other-chat', chatIds: ['other-chat'] };
+  const { w } = await boot([], true, [], [], { sessions: [first, second] });
+  const api = (w as any).api;
+  const a = { id: '11111111-2222-4333-8444-555555555555', name: 'first.txt', mimeType: 'text/plain', size: 42 };
+  const b = { ...a, id: '22222222-2222-4333-8444-555555555555', name: 'second.txt' };
+  const retain = vi.fn(async (_ids: string[]) => ({ ok: true }));
+  api.retainDraftAttachments = retain;
+  const attach = w.document.getElementById('attachImages')!;
+  api.chooseFiles = async () => ({ ok: true, data: [a] });
+  attach.click();
+  await waitFor(() => expect(retain).toHaveBeenLastCalledWith([a.id]));
+
+  w.document.querySelector<HTMLElement>('[data-id="other-session"] [data-session-select]')!.click();
+  await waitFor(() => expect(w.document.querySelector('.sess.is-sel')?.getAttribute('data-id')).toBe(second.id));
+  expect(w.document.querySelector('[aria-label="Remove first.txt"]')).toBeNull();
+  api.chooseFiles = async () => ({ ok: true, data: [b] });
+  attach.click();
+  await waitFor(() => expect(retain).toHaveBeenLastCalledWith([a.id, b.id]));
+  (w.document.querySelector('[aria-label="Remove second.txt"]') as HTMLButtonElement).click();
+  expect(retain).toHaveBeenLastCalledWith([a.id]);
+});
+
 it('restores the image draft after rejected injection and removes native-only delivery when the document is removed', async () => {
   const app = await boot([]);
   const image = { id: '11111111-2222-4333-8444-555555555555', name: 'image.png', mimeType: 'image/png', size: 42 };
   const txt = { ...image, id: '22222222-2222-4333-8444-555555555555', name: 'notes.txt', mimeType: 'text/plain' };
   (app.w as any).api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id, activeTurnId: 'held-turn', canInject: true, queueAtFinish: true } });
   await app.append([]);
+  const retained = vi.fn(async (_ids: string[]) => ({ ok: true }));
+  (app.w as any).api.retainDraftAttachments = retained;
   (app.w as any).api.chooseFiles = async () => ({ ok: true, data: [image, txt] });
   app.w.document.getElementById('attachImages')!.click(); await settle();
   expect(app.w.document.getElementById('afterTurnLabel')!.textContent).toBe('After this turn');
   expect(app.w.document.getElementById('queueAtFinish')!.hidden).toBe(true);
   (app.w.document.querySelector('[aria-label="Remove notes.txt"]') as HTMLButtonElement).click();
   expect(app.w.document.getElementById('immediateDeliveryLabel')!.textContent).toBe('Inject now');
-  (app.w as any).api.sendInput = async () => ({ ok: false, error: 'Image is too large for injection' });
+  let retainedAtSend: string[] | undefined;
+  (app.w as any).api.sendInput = async () => {
+    retainedAtSend = retained.mock.lastCall?.[0];
+    return { ok: false, error: 'Image is too large for injection' };
+  };
   const field = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
   field.value = 'Use the original image';
   app.w.document.getElementById('composer')!.dispatchEvent(new app.w.Event('submit', { bubbles: true, cancelable: true }));
@@ -1217,6 +1896,8 @@ it('restores the image draft after rejected injection and removes native-only de
   expect(field.value).toBe('Use the original image');
   expect(app.w.document.querySelectorAll('#composerImages .image-remove')).toHaveLength(1);
   expect(app.w.document.querySelector('[aria-label="Remove image.png"]')).not.toBeNull();
+  expect(retainedAtSend).toEqual([image.id]);
+  expect(retained.mock.calls).toEqual([[[image.id, txt.id]], [[image.id]]]);
 });
 
 it.each([7, 10, 11])('uses the same visible delivery choice and payload for %s attached images', async count => {
@@ -1234,4 +1915,86 @@ it.each([7, 10, 11])('uses the same visible delivery choice and payload for %s a
   expect(live.sent).toHaveLength(1);
   expect(live.sent[0]?.attachments).toEqual(files);
   expect(live.sent[0]?.delivery).toBe(count > 10 ? undefined : 'tool');
+});
+
+// 2026-10-31: a chat whose next step was not picked up offers one click to go on, in words.
+it.each([['continue', 'Continue now', 'queued', 'Continue queued. It goes out as soon as ChatGPT takes it.'], ['queue', 'Try now', 'retrying', 'Trying again now.']] as const)(
+  'offers %s on a slowed pickup and says what it did', async (next, label, did, said) => {
+  const { w, append } = await boot([]);
+  const api = (w as any).api;
+  const id = summary([]).id;
+  const stoppedAt = Date.now() - 60_000;
+  api.getSessionControls = async () => ({ ok: true, data: { sessionId: id, automation: 'off', objective: '', blocked: '', job: null,
+    recovery: [{ kind: 'pickup-stopped', deadline: stoppedAt, attempts: 3, next }] } });
+  const pickupNow = vi.fn(async () => ({ ok: true, data: { ok: true, did } }));
+  api.pickupNow = pickupNow;
+  await append([]);
+  const button = await waitFor(() => {
+    const found = w.document.querySelector<HTMLButtonElement>('#recoveryStatus .dock-action.is-labelled');
+    expect(found?.textContent).toBe(label);
+    return found!;
+  });
+  button.click();
+  // The click names the stopped step it was shown for (CodeRabbit on #1979).
+  await waitFor(() => expect(pickupNow).toHaveBeenCalledWith(id, { next, stoppedAt }));
+  await waitFor(() => expect(w.document.querySelector('.toast')?.textContent).toBe(said));
+});
+
+it('says why a pickup could not be tried now', async () => {
+  const { w, append } = await boot([]);
+  const api = (w as any).api;
+  api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id, automation: 'off', objective: '', blocked: '', job: null,
+    recovery: [{ kind: 'pickup-stopped', deadline: Date.now() - 60_000, attempts: 3, next: 'goal' }] } });
+  api.pickupNow = async () => ({ ok: true, data: { ok: false, code: 'history-limit' } });
+  await append([]);
+  // Asserted inside the wait: a null element must keep it waiting (CodeRabbit on #1979).
+  const button = await waitFor(() => {
+    const found = w.document.querySelector<HTMLButtonElement>('#recoveryStatus .dock-action.is-labelled');
+    expect(found).not.toBeNull();
+    return found!;
+  });
+  button.click();
+  await waitFor(() => expect(w.document.querySelector('.toast')?.textContent).toBe('ChatGPT is limiting this chat right now. The app tries again when the wait is over.'));
+});
+
+// CodeRabbit on #1979: tries used up leave only a waiting Continue to send; nothing to try again.
+it.each([['goal', false], ['continue', true]] as const)('offers a button on an exhausted %s pickup: %s', async (next, offered) => {
+  const { w, append } = await boot([]);
+  const api = (w as any).api;
+  api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id, automation: 'off', objective: '', blocked: '', job: null,
+    recovery: [{ kind: 'pickup-stopped', deadline: Date.now() - 60_000, attempts: 24, exhausted: true, next }] } });
+  await append([]);
+  await waitFor(() => expect(w.document.querySelector('#recoveryStatus')?.textContent).not.toBe(''));
+  expect(!!w.document.querySelector('#recoveryStatus .dock-action.is-labelled')).toBe(offered);
+});
+
+// CodeRabbit on #1979: the answer for one chat is not shown over another chat selected meanwhile.
+it('keeps the answer of a pickup click off another chat selected meanwhile', async () => {
+  const first: SessionSummary = { ...summary([]), id: 'pickup-first', title: 'First', conversationId: 'pickup-first-chat', chatIds: ['pickup-first-chat'] };
+  const second: SessionSummary = { ...summary([]), id: 'pickup-second', title: 'Second', conversationId: 'pickup-second-chat', chatIds: ['pickup-second-chat'] };
+  const { w } = await boot([], false, [], [], { sessions: [first, second] });
+  const api = (w as any).api;
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { sessionId: id, automation: 'off', objective: '', blocked: '', job: null,
+    recovery: id === first.id ? [{ kind: 'pickup-stopped', deadline: Date.now() - 60_000, attempts: 3, next: 'queue' }] : [] } });
+  let answer: ((value: unknown) => void) | undefined;
+  api.pickupNow = () => new Promise(resolve => { answer = resolve; });
+  const select = async (id: string) => {
+    w.document.querySelector<HTMLElement>(`[data-id="${id}"] [data-session-select]`)!
+      .dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    await settle();
+  };
+  await select(first.id);
+  const button = await waitFor(() => {
+    const found = w.document.querySelector<HTMLButtonElement>('#recoveryStatus .dock-action.is-labelled');
+    expect(found).not.toBeNull();
+    return found!;
+  });
+  button.click();
+  await waitFor(() => expect(answer).toBeTypeOf('function'));
+  await select(second.id);
+  expect(w.document.querySelector(`.sess.is-sel[data-id="${second.id}"]`)).not.toBeNull();
+  answer!({ ok: true, data: { ok: true, did: 'retrying' } });
+  await settle();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  expect([...w.document.querySelectorAll('.toast')].map(node => node.textContent)).not.toContain('Trying again now.');
 });

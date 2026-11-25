@@ -9,6 +9,224 @@ The app and the browser extension in `extension/` are versioned together. **Relo
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.55] — Restore a turn's files, manage Skills from their cards, and safer saves after a crash
+A turn's edited files can be put back from the Changed files card, installed Skills can be paused from their cards, storage can be freed for one chat, and chat groups, settings imports and edit checkpoints survive an interruption.
+### 👉 After updating
+- Nothing to do. The browser extension updates itself.
+### ✨ New
+- **Restore a turn's files.** When a code checkpoint exists, the Changed files card under an answer has a Restore turn button. It asks first, puts the files that turn edited back as they were, warns when a later turn also edited one of them, and Undo in Review opens the "Before restore" checkpoint.
+- **Manage installed Skills from their card.** The card menu of an installed Skill can pause it, turn it on again and show it in your file manager.
+- **Free storage for one chat.** The recording storage dialog shows what the open chat uses and frees only its images or only its long texts. The choices for all chats stay.
+- **A notice when a chat title differs from ChatGPT.** With the new "Check ChatGPT titles" setting on, the chat menu shows a quiet line under Rename when the open ChatGPT chat has another title. Both titles are kept.
+- **Linux: a finished-chat notification opens its tab.** Clicking it selects the matching ChatGPT tab in your browser.
+### 💪 Better
+- **A recorded metric grid shows every card**, including cards with short labels.
+- **The model choice is steadier.** The app tries the requested model once more when ChatGPT takes the choice back as the picker closes, and confirms the reasoning effort against the page's own control before sending when the picker is already closed.
+- **Temporary Chats stay open** while the app recovers a chat.
+- **A settings backup asks again** when a value changed after you looked at the preview, even a change inside the same setting.
+- **Chat groups survive interruptions.** A move to an invalid group is refused before the chat's project changes, and after a crash between moving a chat to another project and saving its group, the group you chose comes back.
+- **Saves hold up.** Edit checkpoints keep a file's content from before the edit, and a failed cleanup of a recording or a failed attachment save recovers cleanly.
+- **A cancelled message does not launch the browser.** Neither does shutting the app down while it looks for a browser.
+- **File search keeps Japanese and other multibyte text intact** in its results.
+- **No more "rate limited" after the clock moved back.** The app answered the browser extension that way for as long as the computer's clock had been corrected backwards.
+- **A retried Local Control API send** for a chat that was already delivered now answers 409 `already_delivered` instead of leaving a stuck queued input.
+- **Clearer diagnostics.** When Compact & Resume cannot open a Project because an old draft stays in the message box, the report now says how long that draft is and how many briefs the page remembers typing.
+### Thank you
+This release is mostly your work. Thank you:
+- **@Neinndall** for restoring a turn's edited files from the Changed files card (with its warning and Undo in Review), for the chat-title notice, for the per-chat storage choices, and for the report on the misleading storage wording that started them.
+- **@atsu6** for six fixes that keep your data safe when something is interrupted: edit checkpoints, recording cleanup and attachment saves (#2249), the chat-group move checks and crash recovery (#2253, #2256), the settings-import re-check (#2255), the cancelled message that launched a browser (#2254) and Japanese and other multibyte text in file search (#2257), plus the steadier timeline test (#2261).
+- **@lavalava45** for pausing, re-enabling and revealing installed Skills from their cards.
+- **@27mfp** for the recorded metric grids that now show every card.
+- **@Kdevaulo** for confirming the model choice against the page's own control, for the test coverage of silent-chat recovery, and for the careful signed-in diagnostics that keep narrowing down the High-turns-into-Medium problem (#2085).
+- **@debxylen** for keeping Temporary Chats open during recovery.
+- **@k-spit** for the Linux notification click that opens the finished chat's tab.
+- **@rockomania-dot**, **@dashielllubsen** and **@digitalscalvia** for their reports and diagnostics on Compact & Resume (#2159, #2223) and on the model confirmation (#2241); **@domenicomassafra** for the replayed-input report that became the `already_delivered` answer (#2247).
+- **@Haz4rdovisk** for the product reviews of every visible change, and everyone who reviewed, tested and filed an issue this round.
+
+## [2.1.54] — Goal chats that don't stand idle, a tidier Settings, and faster chat updates
+
+A Goal or Loop chat whose Compact & Resume got stuck now goes on by itself, Settings is easier to move around in, a chat shows new messages sooner, and Review lists the files a chat edited.
+
+### 👉 After updating
+
+- Nothing to do. The browser extension updates itself.
+
+### ✨ New
+
+- **Review shows what this chat edited.** The Review panel lists the files this chat changed, newest first, and opens each recorded diff. A deleted file says so, a renamed file's old name shows as missing, and a chat with no recorded edits shows nothing extra.
+- **Settings in five pages for Agents.** The long Agents page is now Goal & Loop, Models, Workers, Tools & access and Browser, each short enough to read.
+- **A GitHub skill can be bigger.** Importing a Skill from GitHub takes up to 256 files and a nested Skill folder, downloads from pinned, checked copies, and an update refuses when you edited any of its files.
+
+### 💪 Better
+
+- **Goal and Loop chats do not stand idle.** When Compact & Resume asked for its summary and none came back, or opened its new chat and never heard from it, the chat now goes on in a new chat from its last saved summary. The same happens when ChatGPT stops saving a very long chat and the page keeps showing an older one.
+- **Compact & Resume in a Project is steadier.** The app now recognises its own restored draft, also when the connector was renamed in ChatGPT, empties the handoff request ChatGPT put back, and says what kept the message box when it still cannot open the Project.
+- **Chats update sooner.** A new message or tool call appears in the open chat in a fraction of a second, and the browser tab is told at once when the app has something for it.
+- **A message you steer into a running answer is marked**, and the time worked before it keeps its meaning ("Worked for 45s · steered").
+- **A long answer keeps its place.** A steered answer that is still streaming stays below your message, a discarded half-written note disappears once ChatGPT drops it, and your sent message no longer shows twice for a moment.
+- **A worker that finished with a tool call alone can be woken again**, and a turn that ends with a generated image or a remounted page closes by itself.
+- **The model picker is steadier.** The app confirms the choice after the picker closes and no longer clicks a second time when the first Enter already changed it.
+- **Remote tools reconnect.** A remote MCP plugin whose server started late or dropped comes back by itself, with a growing wait, and a failed call is never sent again.
+- **Attachments stay while a draft needs them**, and an image whose preview ChatGPT renamed with a time stamp is still sent.
+- **The bundled tunnel client is OpenAI's current 0.0.21**, which adds regional control-plane endpoints (unset by default, so nothing changes unless you set one).
+- **The app's own "continue" after a long turn** is no longer shown as something you sent.
+- **A message sent after a turn** is no longer held for minutes when ChatGPT already finished.
+- **Clearer messages.** The `agents` tool says its workers are separate ChatGPT chats, and a chat that reaches its own 192 MiB storage limit says so instead of blaming the global storage.
+
+### 🛠 Fixed
+
+- **Image previews for a very long chat** say the chat reached its own limit, and the storage warning in the log appears once per chat.
+
+### Thank you
+
+To **@Neinndall** for the steered-answer ordering, the retracted half-written notes, the doubled message bubble, the settled-turn closes for remounted pages and generated images, the attachment fixes, the per-chat storage wording and the faster chat updates; **@atsu6** for the worker wake after a tool-only finish, the attachments that stay while a draft needs them, and Review showing what a chat edited; **@Kdevaulo** for the model and effort picker fixes and the quota-warning fix, and for the careful signed-in diagnostics on #2085; **@Akilaydin** for the report and the fix that brings remote plugins back by themselves; and **@lavalava45** for bigger GitHub Skills. And to **@0xConsole**, **@rockomania-dot**, **@WQuendry**, **@ColinKiiim**, **@artcraftfan1**, **@oysOYSoys**, **@kjm0202**, **@ahmedali5696**, **@dashielllubsen**, **@toannv216-oss**, **@fengnaiouo** and **@ralphchristianeclipse** for their reports and diagnostics, which found the stalled Compact & Resume cases fixed here and the ones still being worked on; and to **@Haz4rdovisk** for the product reviews.
+
+## [2.1.53] — Compact & Resume in Projects, Goal chats that recover, and safer saves over SSH
+Compact & Resume now works in Projects where the app started chats, a Goal chat no longer stalls after a failed Continue, and saving a file over SSH can no longer lose the original. A message sent while ChatGPT answers goes out on pages in any language.
+
+### 👉 After updating
+
+- Nothing to do. The browser extension updates itself.
+
+### ✨ New
+
+- **Compact & Resume works in Projects that already hold chats started through the app.** It used to stop with "ChatGPT could not open the source Project" because ChatGPT kept the app's first message as that Project's draft.
+
+### 💪 Better
+
+- **Goal chats recover.** A Goal chat whose Continue failed before any tool call used to sit idle for good; the app now recovers it. A Continue after the app's own Stop stays owed until it is sent. A long turn keeps its final answer when it passes the call and row limits, and a final answer is no longer credited to the wrong turn.
+- **Messages sent while ChatGPT is answering** are sent on pages in every language, not only English.
+- **Model and effort pickers are steadier.** A picker that opens cold is retried, a declined or unreachable desktop input offer is retried before the 30-second alarm, a requested resume or wake model survives a catalog refresh, and the log now says why a selection was not confirmed.
+- **Copy and export keep code literal.** Indented code, code examples and chart blocks are no longer changed when you copy or export an answer or complete a table. Copy and export work again on answers that were reopened, and drawings that overflow are restored first.
+- **A changed message is no longer mislabeled "Edited"** after you steer a running answer.
+- **Preferred Plugins mentions stay bound to the right app** even after it is renamed.
+- **Busy chats are lighter on the disk.** The app saves its bookkeeping in batches instead of rewriting it every few seconds.
+- **Clearer messages.** A sub-agent call that reaches the wrong computer's Core now says to use the Core of the computer whose browser holds the chat. Replacing an existing usage CSV on Linux asks first.
+
+### 🛠 Fixed
+
+- **Saving over SSH never deletes your original file.** If the server refuses a rename or the final close fails, the original stays and the app puts it back.
+- **A project whose saved list cannot be read keeps its identity** instead of being treated as new.
+- **A chat you removed before it was sent** no longer comes back in the send queue after a restart.
+- **The Files preview** no longer draws a vector file that is only named like a picture.
+- **A refused Goal reply save** restores only its own row, and an older accepted reply cannot replace a newer one.
+
+## [2.1.52] — A list of your scheduled messages, and search through whole long chats
+You can now see every scheduled message of your chats in one list, and chat search finds words anywhere in very long chats. Compact & Resume in a Project survives a page reload, and Skills are no longer chosen when you say not to use them.
+
+### 👉 After updating
+
+- Nothing to do. The browser extension updates itself.
+- The first chat searches after updating rebuild each chat's search index once, in the background. Results fill in as it goes.
+
+### ✨ New
+
+- **Scheduled.** A new page in the sidebar lists the scheduled messages of all your chats, with when each runs next, how often, and its text. From there you can pause or resume a schedule, run it now, delete it, or open its chat.
+- **Search covers the whole history of long chats.** It used to stop after the first million characters of a chat; now every message is searched, however long the chat is, and big chats are read in small pieces so the app stays light.
+
+### 💪 Better
+
+- **Compact & Resume in a Project after a reload.** If the page reloaded while it ran, it could fail every time afterwards. The app now clears its own leftover brief and goes on.
+- **Search retries after a temporary error.** A chat whose search index could not be saved is tried again (at most every 30 seconds) instead of staying out of search until the chat changes.
+- **Skills are not chosen when you say not to use them**, and a Skill's name is recognised in Japanese when a particle follows it, as in `code-reviewを使って`.
+- **Copied tables keep their own rows** when an answer has several tables with the same column headings.
+- **Clearer logs.** A failed schedule action and every decision about a scheduled message (moved, released, timed out) now say which and why, and a Stop that no page took no longer reads as a contradiction.
+
+### 🛠 Fixed
+
+- A very long chat title or message on the Scheduled page wraps inside its card instead of pushing the page sideways.
+
+## [2.1.51] — Steps for you, a limit on busy chats, and Telegram
+ChatGPT can now hand you a step it cannot do itself, you can limit how many chats work at once, and you can get your chat notifications in Telegram. Chats that get stuck after a Stop or a reload now end up where you expect, and the browser extension and ChatGPT's page share the app's look.
+
+### 👉 After updating
+
+- Nothing to do. The browser extension updates itself.
+- Telegram is optional and off until you link your own bot. See **Settings → Phone notifications → Telegram**.
+
+### ✨ New
+
+- **Steps for you.** When ChatGPT needs something only you can do (a sign-in, a USB key, a command it must not run), it hands you a step. It appears in the chat and above the message box with the exact command, the folder and what it expects to see. You run it yourself and mark it **done** or **skip** it, and ChatGPT is told which. The app never runs it.
+- **Chats working at once.** Settings → Agents & automation has a limit for how many chats may work at the same time. Messages the app sends by itself (Goal, Loop, Continue) wait for a free slot; a message you send always goes out.
+- **Command output, read-only.** A command that an agent runs has its output in the Terminal dock. You can watch it, but typing there does nothing, and secrets are hidden.
+- **Related folders for a project.** Add context folders from your approved folders to a project: ChatGPT is told about them, but they never become the working folder or grant access.
+- **"Why is it stuck?" in one row.** When a chat has trouble, one row shows since when, how often the app tried, and each step it took. It turns amber once the app has stopped trying.
+- **Telegram notifications, with your own bot.** Get a message when a chat finishes, needs you or fails, ask `/status` for what is running, and use **Deny** under an approval. `/stop`, `/pause` and `/resume` act on a chat, and replies to a notification can go to that chat as your message if you turn that on (it is off by default). Remote **Allow** does not exist.
+- **The browser extension and ChatGPT's page in the app's look.** The extension's popup and the app's parts inside ChatGPT use the same colors, theme and switches.
+- **Linux:** read-only screenshots on GNOME with a consent message in your language, and desktop control of the chat's own windows.
+
+### 💪 Better
+
+- **Stop works all the way.** After you pressed Stop, a tool call ChatGPT had already lined up could reopen the turn and leave the chat "working" for good, with your next message waiting behind it. The app now ends such a turn again once it goes quiet, and a Stop is never refused because of missing bookkeeping.
+- **Compact & Resume is more reliable.** It keeps its summary when ChatGPT opens a Project late, no longer asks for a receipt that never comes, and clears its own leftover brief from the Project's home.
+- **A held message stays queued.** When the page holds your message until ChatGPT's answer ends, the queue says so instead of calling it "not picked up".
+- **Easier on ChatGPT's history limit.** The app waits longer between tries, up to an hour, and presses ChatGPT's own Retry only while it still has work in that chat.
+- **No leftover Continue in the message box.** If ChatGPT restores the app's own already-sent message, the repair clears it itself.
+- **Images that ChatGPT generates** are recorded in full, also when they appear inside its working group, and older images keep ChatGPT's own times.
+- **Tool calls find their chat.** Calls are matched to their chat through the proven ChatGPT session, so later calls in a long chat no longer end up unattributed.
+- **New chat tabs are followed** in your browser once the chat exists.
+- **Clear logs.** Who sent each Stop and each Goal or Loop switch is now in the log.
+- **The bundled OpenAI tunnel client** is updated to v0.0.20.
+
+### 🛠 Fixed
+
+- A step ChatGPT hands you in a new chat's first answer is no longer refused.
+- ChatGPT's own Retry button label no longer appears at the end of its error text.
+- Small layout fixes: the plugin offer in narrow windows, the folder choice in Related folders on one line, and the time of an answered step.
+- Text fixes in several languages in the extension popup.
+- Fewer false "chat closed" messages when a tab outlives its worker.
+- A damaged entry in a chat's saved bookmarks no longer hides the valid ones.
+- An answer that kept growing after a Stop that ChatGPT had not obeyed is no longer cut off after its first sentence in the app.
+- Tabs that an agent opens through the browser stay in the Chrome window it is already working in, instead of following the window you last clicked.
+- A chat no longer stays "working" for hours when ChatGPT's request keeps calling tools after the page reported its answer finished and then goes quiet: the app ends that turn again after 11 minutes.
+- Update downloads that are no longer needed are cleaned up without losing handoff receipts.
+
+## [2.1.50] — Move chats between projects, and chats that keep going
+
+You can now move a chat into another project by dragging it or from its menu, with Undo. Long chats keep going in more situations: when a step is not picked up, the app keeps trying, tells you, and lets you continue with one click. The browser extension now updates itself even while long chats run, and very long chats no longer slow the app down.
+
+### 👉 After updating
+
+- Nothing to do. The browser extension updates itself. A chat that is still answering delays that by at most 30 minutes; a tool call or a message being sent still finishes first.
+
+### ✨ New
+
+- **Move chats between projects.** Drag a chat onto a project, or onto one of its groups, or use **Move to project** in the chat's menu. A notice says where it went and offers **Undo**. Chat lists also show **Today**, **Yesterday** and earlier date headings. The move happens only in the app; a chat linked to a ChatGPT Project stays where it is in ChatGPT.
+- **The new project's folder, said once.** After you move a chat into a project, your next message there tells ChatGPT the project's folder once, so it works in the right place.
+- **Continue now and Try now.** When a chat's quick tries run out, the app tells you, also on your phone if you set that up, and the chat's notice has **Continue now** or **Try now** to go on at once.
+- **Continue from the last summary.** When ChatGPT stops serving a chat for good, the app can continue it in a new ChatGPT chat from its last summary, still as one chat in the app.
+
+### 💪 Better
+
+- **Chats keep going.** After its quick tries, the app no longer gives up on a step that nobody picked up. It keeps trying every 15 to 60 minutes and says why a step waits. An automatic Continue that waited too long is sent as an ordinary message.
+- **Fresh turns by default.** When ChatGPT shows only Stop for a long time, the app stops and continues in a fresh turn. This was an experimental option and is now on for everyone; you can still turn it off in Settings.
+- **The extension updates during long runs.** It used to wait until no chat was answering, which in busy setups could mean never.
+- **Big chats stay fast.** In very long chats, the app no longer reads the whole history again and again. An automatic Continue that no longer fits the chat's last question is withdrawn instead of being offered for hours.
+- **Thorough Goal helpers get time.** A Goal or Loop helper set to extra-high or Pro reasoning now gets up to 12 or 20 minutes for its next message instead of timing out after three.
+- **Workers in the right mode.** A worker chat picks its own model before its wake-up message is typed.
+- **Compact chat lists.** Rows in Projects and Chats are tighter, so more chats fit on screen, and the keyboard focus outline is fully visible again. Inbox cards stay as they were.
+- **Chat menus on short windows.** A chat's menu that fit on neither side of its button showed a scrollbar for a few pixels. It now opens whole beside the button.
+- **Plugins, Skills and Pets** say when their list could not be loaded, instead of "Loading…" for good.
+- **Layout polish:** the + menu, text fields in Settings and the update card in every language.
+
+### 🛠 Fixed
+
+- **Loop chats that stopped when the helper's message got too long.** The helper was never told the length limit, so in long Loop chats its messages grew until one no longer fit, and every retry failed the same way. It is now told the limit, and after a message that was too long it is asked for a shorter one.
+- **The composer gear was missing on an empty message box.** After a change on ChatGPT's side, the Chat On Steroids gear only appeared once you typed something. It is back on every composer.
+- **Recovery that stopped while a tab was stuck.** A tab stuck in rendering mode could stop the app from recovering any chat. Recovery now goes on, and a chat that needs its tab shown gets it shown once.
+- **The app's own leftover text blocking messages.** When an automatic message could not be sent and stayed in ChatGPT's message box, every later message waited behind it. The app now replaces its own leftover.
+- **Tool activity in the right chat** across continued ChatGPT answers, and follow-up questions shown in the right order during a running answer.
+- **A turn waiting on ChatGPT's approval card** stays open instead of being counted as finished.
+- **New chats whose tab disappeared** get a fresh tab instead of waiting for ever.
+- **Offline Goal** reads its decision from the final answer, not from commentary after it.
+- **Files** whose tile repeats the file name are recognized as attached.
+- **Plugins refresh** checks work with all valid tool names and wait for slow settings pages.
+- **macOS:** the tunnel client recovers when the installer's temporary folder was deleted.
+
+### Thank you
+
+To **@Neinndall** for the attribution fix for continued answers and the ordering fix for follow-up questions, **@atsu6** for the Plugins refresh and macOS tunnel fixes, and **@lavalava45** for recovering lost new-chat tabs. And to **@scuan2**, **@ColinKiiim**, **@diegogarciarojo**, **@Minayuki523**, **@tngcphng** and **@Kdevaulo** for their reports.
+
 ## [2.1.49] — Long chats that get through ChatGPT's limits, and message times
 
 Long chats no longer stop when ChatGPT briefly limits a chat's history or the app is busy with other chats, and ChatGPT's own pop-ups no longer block your messages. You can also show the time of each message.
@@ -1782,7 +2000,7 @@ Windows/macOS/Linux build matrix can be published under a fresh tag instead of t
 This is the post-2.0 hardening pass. It is unusually broad because it combines the reusable-worker
 rewrite, a live transcript/Goal investigation, session-store recovery work, the first Computer Use
 overhaul tranche, and an adversarial restart/race audit. The detailed engineering log is in
-`docs/bughunt-2026-08-25.md`.
+`docs/archive/bughunt-2026-08-25.md`.
 
 ### Added
 - **Workers are reusable ChatGPT conversations.** A worker that finishes normally now sleeps,
@@ -2002,7 +2220,7 @@ against the removed internals, or against the old pass-through behaviour, will n
   wrapper, and two dead MCP formatting exports.
 
 ### Fixed
-Full write-up, defect by defect, in `docs/bughunt-follow-up-2026-08-24.md`. Credible leads that
+Full write-up, defect by defect, in `docs/archive/bughunt-follow-up-2026-08-24.md`. Credible leads that
 were reviewed but not reproducible enough to fix are tracked privately rather than published, as
 `SECURITY.md` and the documentation rule in `AGENTS.md` require.
 
@@ -2107,8 +2325,8 @@ were reviewed but not reproducible enough to fix are tracked privately rather th
   worth spending a token on is asking it to think before it starts.
 
 ### Fixed
-Full write-up, with what each defect actually did, in `docs/bug-audit-2026-08-23.md` and
-`docs/bug-audit-2026-08-24.md` — the second pass audited the merged tree for ordering at the
+Full write-up, with what each defect actually did, in `docs/archive/bug-audit-2026-08-23.md` and
+`docs/archive/bug-audit-2026-08-24.md` — the second pass audited the merged tree for ordering at the
 crash, reload and navigation boundaries, where several of these were correct a second later and
 wrong at the moment a caller decides whether its operation happened.
 

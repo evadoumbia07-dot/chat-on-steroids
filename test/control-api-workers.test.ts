@@ -232,6 +232,8 @@ it('retains local ownership and unread reports through a broker restart', async 
   broker.restoreSwarm(snapshot);
   broker.onSwarmPersistNow(state => durable.writeDurableNow('swarm', state));
   const status = await worker('status', { ownerId, runId: spawn.runId });
+  expect(status.body.runId).toBeNull();
+  expect(status.body.nativeBroker).toMatchObject({ localOwnerId: ownerId, runId: spawn.runId, missionAck: false });
   expect(status.body.workers).toMatchObject([{ id: 'worker-1', state: 'sleeping', revivable: true }]);
   expect((await worker('reports', { ownerId, runId: spawn.runId })).body.messages).toMatchObject([{ from: 'worker-1', text: expect.stringContaining('retained report') }]);
 });

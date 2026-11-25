@@ -112,7 +112,8 @@ export function settingsForBackup(schema: z.ZodType, value: unknown): Settings {
   return out;
 }
 
-function withoutPerComputer(settings: Settings): Settings {
+/** Shared by the file format and the import preview value snapshot. */
+export function withoutPerComputer(settings: Settings): Settings {
   const out = structuredClone(settings);
   for (const path of PER_COMPUTER) {
     let parent: unknown = out;
@@ -169,7 +170,7 @@ export function widerAccess(before: Settings, after: Settings): string[] {
   if (at(before, 'readOnly') === true && at(after, 'readOnly') === false) wider.push('readOnly');
   const rulesBefore = at(before, 'commandAllowlist'), rulesAfter = at(after, 'commandAllowlist');
   if (isPlainObject(rulesBefore) && rulesBefore['enabled'] === true && JSON.stringify(rulesBefore) !== JSON.stringify(rulesAfter)) wider.push('commandAllowlist');
-  for (const path of ['controlApi.enabled', 'controlApi.allowActions', 'multiAgent.allowUnattributedCalls', 'ui.desktopUnattributed']) if (turnedOn(path)) wider.push(path);
+  for (const path of ['controlApi.enabled', 'controlApi.allowActions', 'multiAgent.allowUnattributedCalls', 'ui.desktopUnattributed', 'ui.linuxDesktopEnabled', 'ui.phonePush.telegramSteer']) if (turnedOn(path)) wider.push(path);
   if (turnedOff('multiAgent.strictChatAllowlist', false)) wider.push('multiAgent.strictChatAllowlist');
   // Missing means on, as in the saved settings.
   if (turnedOff('ui.secretsShield', true)) wider.push('ui.secretsShield');

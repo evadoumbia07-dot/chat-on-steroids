@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 import type { AgentInfo, AgentMessage, AgentState, ReasoningEffort, SwarmState } from '../shared/session.js';
 import { REASONING_EFFORTS, isReasoningEffort } from '../shared/session.js';
 import { getConfig } from './config.js';
+import { setWorkerSlotSource, workerSlotsRefusal } from './chats-at-once.js';
 import { liveConnectorName } from './mcp/surfaces.js';
 import { workerBrief, workerOwnTask } from '../shared/worker-brief.js';
 import { getChatModels, refreshForUnoffered } from './chat-models.js';
@@ -147,7 +148,8 @@ export class NoChatError extends AgentsBusyError {
         '(a client such as Codex sends every tool call as a new request). A sub-agent run belongs to the chat, or the ' +
         'single request, that started it, so this call cannot reach a run started by another call. Do not call agents ' +
         'action=spawn again: a new run would be just as unreachable. Sub-agents work from a ChatGPT chat in the browser; ' +
-        'if this is one, the app may identify it in a moment.'
+        'if this is one, the app may identify it in a moment. If the chat is open in another computer\'s browser, call ' +
+        'that computer\'s Core instead: only the computer whose browser holds the chat can identify it.'
     );
   }
 }
@@ -220,6 +222,22 @@ export class IdentityLostError extends AgentError {
 export function isOver(state: AgentState): boolean {
   return state === 'finished' || state === 'failed';
 }
+
+/** A woken worker still asleep this long after its slot was reserved was not woken after all. */
+const WAKE_SLOT_GRACE_MS = 10_000;
+const workerSlotKey = (runId: string, id: string): string => `${runId}/${id}`;
+// What became of a worker a "Chats working at once" slot was reserved for (#1694, Haz on #2051).
+setWorkerSlotSource((key, reservedAt, now) => {
+  const slash = key.lastIndexOf('/');
+  const run = runs.get(key.slice(0, slash));
+  // The run is gone: its spawn was refused or it ended.
+  if (!run) return { kind: 'over' };
+  const agent = run.agents.get(key.slice(slash + 1));
+  if (!agent) return { kind: 'pending' };
+  const state = agent.info.state;
+  if (isOver(state) || state === 'detached' || (state === 'sleeping' && now - reservedAt > WAKE_SLOT_GRACE_MS)) return { kind: 'over' };
+  return agent.info.conversationId ? { kind: 'chat', conversationId: agent.info.conversationId } : { kind: 'pending' };
+});
 
 /**
  * Whether this state consumes one of the run's worker slots.
@@ -1935,12 +1953,12 @@ function usableDefaults(
   // resolved label canonicalizes to the family. An ambiguous label stays a dropped default.
   const resolved = defaultModel && model ? resolveChatModel(models, model) : undefined;
   if (defaultModel && model && !resolved) {
-    notes.add(`The default worker model "${model}" saved in Settings is not offered by this ChatGPT account, so workers use ChatGPT's current model. Choose an available model in Settings → Agents & automation.`);
+    notes.add(`The default worker model "${model}" saved in Settings is not offered by this ChatGPT account, so workers use ChatGPT's current model. Choose an available model in Settings → Models.`);
     model = null;
   } else if (resolved && resolved.id !== model && !resolved.aliases?.includes(model!)) model = resolved.id;
   const offered = model ? (resolved ? [resolved] : models.filter(choice => choice.id === model || choice.aliases?.includes(model!))) : models;
   if (defaultEffort && effort && !offered.some(choice => choice.efforts.includes(effort!))) {
-    notes.add(`The default worker reasoning "${effort}" saved in Settings is not offered${model ? ` for model "${model}"` : ''} by this ChatGPT account, so workers use ChatGPT's current reasoning. Choose an available level in Settings → Agents & automation.`);
+    notes.add(`The default worker reasoning "${effort}" saved in Settings is not offered${model ? ` for model "${model}"` : ''} by this ChatGPT account, so workers use ChatGPT's current reasoning. Choose an available level in Settings → Models.`);
     effort = null;
   }
   if (notes.size) refreshForUnoffered(`default worker ${[...notes].join(',')}`);
@@ -2312,6 +2330,19 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
   for (let n = 1; ids.length < planned.length; n++) {
     const id = `worker-${n}`;
     if (!activeRun.agents.has(id)) ids.push(id);
+  }
+
+  // Chats working at once (#1694): workers are chats too. The prime's own slot passes to them, and
+  // each new worker's slot is named after it so it follows the worker (Haz on #2051).
+  const chatsAtOnce = workerSlotsRefusal(conversationId, ids.map(id => workerSlotKey(activeRun.runId, id)));
+  if (chatsAtOnce) {
+    if (resumedDormant) parkRun(run, 'a new spawn was refused by the chats-at-once limit');
+    else if (createdFreshRun) runs.delete(run.runId);
+    logInfo(`agents: spawn of ${planned.length} worker(s) refused: ${chatsAtOnce}`);
+    throw new AgentError(
+      `CHATS_AT_ONCE: ${chatsAtOnce} ("Chats working at once" in the app). No workers were created. ` +
+        'Continue the work yourself, or end this turn and spawn when another chat has finished; do not retry right away.'
+    );
   }
 
   const created: AgentInfo[] = [];
@@ -2773,6 +2804,15 @@ function stageMessagesActive(
           throw new AgentError(
             `GLOBAL_WORKER_LIMIT: ${toId} is asleep and all ${globalMax} globally admitted worker slots are busy, so it ` +
               `cannot be woken right now${where}. Nothing was sent. Wait for a worker to stop and try again.`
+          );
+        }
+        // Chats working at once (#1694): a woken worker is a working chat again.
+        const chatsAtOnce = workerSlotsRefusal(caller.conversationId ?? null, [workerSlotKey(run?.runId ?? to.info.workerAllocationRunId ?? '', to.info.id)]);
+        if (chatsAtOnce) {
+          logInfo(`agents: waking ${toId} refused: ${chatsAtOnce}`);
+          throw new AgentError(
+            `CHATS_AT_ONCE: ${toId} is asleep and ${chatsAtOnce} ("Chats working at once" in the app), so it cannot be ` +
+              `woken right now${where}. Nothing was sent. Continue yourself, or end this turn and try when another chat has finished.`
           );
         }
       }

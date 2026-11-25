@@ -75,25 +75,41 @@ app.whenReady().then(async () => {
     for (const theme of ['dark', 'light']) for (const width of [900, 1440]) for (const zoom of [1, 1.25]) {
       win.setSize(width, 950); win.webContents.setZoomFactor(zoom);
       await js(`document.documentElement.dataset.theme = '${theme}'`);
-      for (const page of ['home', 'general', 'appearance', 'usage', 'setup', 'chat', 'activity']) {
+      for (const page of ['home', 'general', 'appearance', 'usage', 'setup', 'agents-goal', 'agents-models', 'agents-workers', 'agents-tools', 'agents-browser', 'activity']) {
         const result = await js(`(async () => {
-          for (const panel of document.querySelectorAll('.panel')) panel.classList.toggle('is-active', panel.dataset.panel === '${page}');
-          for (const button of document.querySelectorAll('#tabs button')) button.classList.toggle('is-sel', button.dataset.tab === ('${page}' === 'chat' ? 'settings' : '${page}'));
+          const agents = '${page}'.startsWith('agents-'), panelName = agents ? 'chat' : '${page}';
+          for (const panel of document.querySelectorAll('.panel')) panel.classList.toggle('is-active', panel.dataset.panel === panelName);
+          for (const button of document.querySelectorAll('#tabs button')) button.classList.toggle('is-sel', button.dataset.tab === '${page}');
+          if (agents) document.querySelector('.automation-content').dataset.agentsCurrent = '${page}'.slice('agents-'.length);
           for (const view of document.querySelectorAll('[data-view]')) view.hidden = view.dataset.view !== 'settings';
           // Real openChatView hides the composer for settings; this fixture has no chat runtime.
           document.getElementById('composer').hidden = true;
-          const panel = document.querySelector('[data-panel="${page}"]'); panel.scrollTop = 0;
+          const panel = document.querySelector('[data-panel="' + panelName + '"]'); panel.scrollTop = 0;
           // Layout checks measure settled geometry; hidden Chromium windows may throttle time.
           for (const animation of document.getAnimations()) if (Number.isFinite(animation.effect.getComputedTiming().endTime)) animation.finish();
           const overflows = [...panel.querySelectorAll('.settings-page-content, .settings-surface, .pane')]
             .filter(el => el.checkVisibility() && !['auto', 'scroll'].includes(getComputedStyle(el).overflowX) && el.scrollWidth > el.clientWidth + 1)
             .map(el => el.id || el.className);
           const grid = document.querySelector('.heat-grid');
-          return { overflows, pageOverflow: panel.scrollWidth > panel.clientWidth + 1,
+          // Design audit 2026-11-01: a text field beside its explanation squeezed it to a narrow column
+          // (8 lines in German). The explanation keeps at least 20rem, or the field moves under it.
+          const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
+          const squeezed = [...panel.querySelectorAll('.setting-text-field, .phone-push-field')].filter(row => row.checkVisibility()).filter(row => {
+            const text = row.querySelector('.setting-text').getBoundingClientRect(), control = row.querySelector('.setting-text-control, .phone-push-control').getBoundingClientRect();
+            return control.top < text.bottom - 1 && text.width < 20 * rem - 1;
+          }).map(row => row.querySelector('input').id);
+          // The update card ends at its padding: an actions row with nothing to show takes no space.
+          let cardTail = 0;
+          if ('${page}' === 'activity') {
+            const card = document.getElementById('updateReadinessCard'), box = card.getBoundingClientRect();
+            const last = Math.max(...[...card.children].filter(child => child.checkVisibility() && child.getBoundingClientRect().height > 0).map(child => child.getBoundingClientRect().bottom));
+            cardTail = Math.round(box.bottom - last - parseFloat(getComputedStyle(card).paddingBottom) - parseFloat(getComputedStyle(card).borderBottomWidth));
+          }
+          return { overflows, squeezed, cardTail, pageOverflow: panel.scrollWidth > panel.clientWidth + 1,
             heatColumns: '${page}' === 'usage' ? getComputedStyle(grid).gridTemplateColumns.split(' ').length : null,
             heatHeight: '${page}' === 'usage' ? grid.getBoundingClientRect().height : null };
         })()`);
-        if (result.pageOverflow || result.overflows.length || (page === 'usage' && (result.heatColumns !== 53 || result.heatHeight < 70))) failures.push({ theme, width, zoom, page, ...result });
+        if (result.pageOverflow || result.overflows.length || result.squeezed.length || Math.abs(result.cardTail) > 1 || (page === 'usage' && (result.heatColumns !== 53 || result.heatHeight < 70))) failures.push({ theme, width, zoom, page, ...result });
         if (page === 'home') {
           const emptySpacing = await js(`(() => {
             const empty = document.getElementById('rootsEmpty'); empty.hidden = false;
@@ -166,7 +182,7 @@ app.whenReady().then(async () => {
         if (zoom === 1) {
           await js('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
           fs.writeFileSync(path.join(output, `${theme}-${width}-${page}.png`), (await win.webContents.capturePage()).toPNG());
-          if (page === 'chat' && width === 1440) {
+          if (page === 'agents-tools' && width === 1440) {
             const autoSkill = await js(`(() => {
               const input = document.getElementById('autoSelectSkills');
               input.scrollIntoView({ block: 'center' });
@@ -201,6 +217,7 @@ app.whenReady().then(async () => {
     win.setSize(1440, 950); win.webContents.setZoomFactor(1);
     const review = await js(`(async () => {
       document.querySelectorAll('.panel').forEach(p => p.classList.toggle('is-active', p.dataset.panel === 'chat'));
+      document.querySelector('.automation-content').dataset.agentsCurrent = 'goal';
       for (const view of document.querySelectorAll('[data-view]')) view.hidden = view.dataset.view !== 'settings';
       document.documentElement.dataset.theme = 'dark';
       const input = document.getElementById('finishHoldOnStop'), label = input.closest('label');
@@ -209,12 +226,12 @@ app.whenReady().then(async () => {
       return { section: input.closest('.settings-surface').previousElementSibling.querySelector('h2').textContent,
         description: label.querySelector('em').textContent, checked: input.checked, visible: input.checkVisibility() };
     })()`);
-    assert.equal(review.section, 'Unfinished answers, Goal and Loop');
+    assert.equal(review.section, 'Goal');
     assert.ok(review.description.startsWith('When Goal reports completion'));
     assert.equal(review.checked, false);
     assert.equal(review.visible, true);
     fs.writeFileSync(path.join(output, 'goal-completion-review.png'), (await win.webContents.capturePage()).toPNG());
-    // Agents & automation shares the chat host. Exercise real dock layout classes,
+    // The Agents pages share the chat host. Exercise real dock layout classes,
     // including expanded/narrow/closing states, without starting a terminal process.
     for (const width of [760, 1440]) {
       win.setSize(width, 950); win.webContents.setZoomFactor(1);

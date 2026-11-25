@@ -258,6 +258,8 @@ export interface UiPrefs {
   desktopAsk?: 'off' | 'active' | 'always';
   /** Desktop control for a call the app cannot tie to a chat. Off unless chosen. */
   desktopUnattributed?: boolean;
+  /** Separately authorize native Linux accessibility/screenshot access. Missing means off. */
+  linuxDesktopEnabled?: boolean;
   /** Light or Dark stays as chosen; System follows the operating system (#1914). */
   theme: import('./appearance.js').ThemeChoice;
   appearance?: import('./appearance.js').AppearanceSettings;
@@ -272,6 +274,7 @@ export interface SessionSettings {
   record: boolean;
   /** Compatibility projection. Canonical value is 0: recordings do not expire by age. */
   retainDays: number;
+  checkWebChatTitles?: boolean;
   /** Estimated tokens at which the app starts suggesting a compaction. */
   advisoryTokens: number;
   /** Estimated tokens at which that suggestion becomes urgent. */
@@ -420,6 +423,8 @@ export interface MultiAgentSettings {
    * queue ordinary prompts, switch Goal work, or evict workers that are already running.
    */
   globalMaxWorkers?: number;
+  /** Chats working at once (#1694): 0 is off; 1–10 holds the app's automatic sends beyond that many working chats. */
+  chatsAtOnce?: number;
   /** Permit self-contained calls when browser evidence cannot identify their conversation. */
   allowUnattributedCalls: boolean;
   /** Default-deny local tools to exact trusted conversations. */
@@ -668,6 +673,8 @@ export interface LogEntry {
 
 /** What the renderer needs to know about the extension bridge, without any secrets. */
 export interface BridgeStatus {
+  /** "Chats working at once" (#1694): ChatGPT asked the app to slow down; automatic sends wait until then. Null otherwise. */
+  automaticPauseUntil?: number | null;
   /** Effective environment override, independent of the saved Settings choice. */
   portOverridden?: boolean;
   /** Last startup failure; a rejected settings change keeps the working bridge status. */
@@ -919,6 +926,8 @@ export interface AppState {
   hasCustomProviderKey: boolean;
   /** An ntfy access token is saved (never the token itself). */
   hasPhonePushToken?: boolean;
+  /** The Telegram bot (#1934): linked or not, its @name and the account; never the token. */
+  telegram?: { state: 'off' | 'pairing' | 'linked' | 'conflict' | 'token-refused'; botName: string | null; userName: string | null; code?: string; codeUntil?: number };
   /** Resolved path of the tunnel binary we would run, or null if we cannot find one. */
   resolvedBinary: string | null;
   /** Version of the tunnel-client copy shipped inside the app, for diagnostics. */

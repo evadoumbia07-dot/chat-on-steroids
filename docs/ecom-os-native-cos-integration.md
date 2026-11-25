@@ -131,3 +131,17 @@ reserves half a core per pending/new worker. System-wide load can be
 conservative for constrained workers. The lower of CPU and RAM headroom
 wins, without overriding configured limits or provider quotas. This is an
 admission guard only, not process throttling or PC/VPS dispatch.
+
+## Local controller dispatch transport
+
+scripts/ecom-cos-native-dispatch.mjs connects a trusted host to the existing
+authenticated loopback worker API, with no prime conversation. It requires
+an actual canonical assertion bound to the immutable dispatch scope before
+reading and again immediately before submitting one request. It uses the
+stable family ID for subsequent work and checks native readback. A lost or
+ambiguous response is UNKNOWN_EFFECT; it never retries a POST. The host
+must serialize its canonical dispatch and reconcile uncertain effects.
+This client does not establish canonical trust by itself; a real controller
+binding remains required. No public endpoint, tool, scheduler or new owner
+registry is introduced. Worker-to-worker spawn remains explicitly forbidden
+by upstream; approved additional workers are admitted by the owner.

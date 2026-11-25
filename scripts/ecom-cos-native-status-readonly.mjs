@@ -145,6 +145,10 @@ export async function readNativeCosOwnerStatus({
     };
   });
   const browser = browserDelivery(raw, workers);
+  if (raw.admissibleWorkerSlots !== undefined &&
+      (!Number.isSafeInteger(raw.admissibleWorkerSlots) || raw.admissibleWorkerSlots < 0 ||
+       raw.admissibleWorkerSlots > safeCount(raw.freeWorkerSlots)))
+    throw Error('COS_NATIVE_ADMISSION_CAPACITY_INVALID');
   return {
     schema: 'ECOM_COS_NATIVE_OWNER_STATUS_READONLY_V1',
     source: 'authenticated-original-cos-control-api',
@@ -155,6 +159,7 @@ export async function readNativeCosOwnerStatus({
     ...(browser ? { browserDelivery: browser } : {}),
     retainedHistory: raw.retainedHistory === true,
     freeWorkerSlots: safeCount(raw.freeWorkerSlots),
+    ...(raw.admissibleWorkerSlots !== undefined ? { admissibleWorkerSlots: raw.admissibleWorkerSlots } : {}),
     workers,
     // A CoS status is never a provider result or independent ECOM OS ACK.
     canonicalMissionAck: false

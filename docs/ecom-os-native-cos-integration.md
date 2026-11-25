@@ -107,3 +107,16 @@ grace, even with no ChatGPT HTTP activity. Reconnection asks the same
 coalesced delivery pump to inspect unleased fresh commands. It never clears
 a durable opening lease, retries a claimed send or creates another queue.
 The existing lifecycle and recovery fences remain in force.
+
+## Optional host RAM admission guard
+
+The existing multiAgent config accepts hostMemoryGuard (off by default).
+When enabled, native spawn, explicit sleeping-worker wake and automatic
+queued wake admission account for local available RAM and pending reserved
+workers, including unpublished reservations across families. The initial
+conservative estimate reserves max(1536 MiB, 20% of host RAM) and 512 MiB
+per pending/new worker; it is not measured browser consumption. No existing
+workers are killed or paused. The configured family/global caps and
+provider limits still apply. Controller reads include admissibleWorkerSlots
+when present, distinct from family freeWorkerSlots. This is host-local, not
+a remote-host selection policy; enable only after isolated acceptance.

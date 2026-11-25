@@ -165,3 +165,11 @@ test('retains only owner-scoped queue diagnostics and rejects a stale or foreign
   await assert.rejects(readNativeCosOwnerStatus(options({...raw,browserDelivery:{...raw.browserDelivery,
     runId:'33333333-3333-4333-8333-333333333333'}}).options),/COS_NATIVE_BROWSER_DELIVERY_INVALID/);
 });
+
+test('reports actual broker admission headroom rather than only family capacity', async () => {
+  const raw = {nativeBroker:proof,runId:run,workers:[],freeWorkerSlots:4,admissibleWorkerSlots:0};
+  const r = await readNativeCosOwnerStatus(options(raw).options);
+  assert.equal(r.freeWorkerSlots,4);
+  assert.equal(r.admissibleWorkerSlots,0);
+  await assert.rejects(readNativeCosOwnerStatus(options({...raw,admissibleWorkerSlots:5}).options),/COS_NATIVE_ADMISSION_CAPACITY_INVALID/);
+});

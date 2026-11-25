@@ -423,6 +423,8 @@ export interface MultiAgentSettings {
    * queue ordinary prompts, switch Goal work, or evict workers that are already running.
    */
   globalMaxWorkers?: number;
+  /** Optional host RAM admission guard; never evicts existing workers. */
+  hostMemoryGuard?: boolean;
   /** Chats working at once (#1694): 0 is off; 1–10 holds the app's automatic sends beyond that many working chats. */
   chatsAtOnce?: number;
   /** Permit self-contained calls when browser evidence cannot identify their conversation. */

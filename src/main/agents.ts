@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 import type { AgentInfo, AgentMessage, AgentState, ReasoningEffort, SwarmState } from '../shared/session.js';
 import { REASONING_EFFORTS, isReasoningEffort } from '../shared/session.js';
 import { getConfig } from './config.js';
+import { hostMemoryAdmissionSlots } from './native-worker-capacity.js';
 import { setWorkerSlotSource, workerSlotsRefusal } from './chats-at-once.js';
 import { liveConnectorName } from './mcp/surfaces.js';
 import { workerBrief, workerOwnTask } from '../shared/worker-brief.js';
@@ -1355,7 +1356,7 @@ export interface CallerSwarmStatus {
   runId: string | null;
   /** Capacity available inside this caller's own worker family, before any optional global cap. */
   freeWorkerSlots: number;
-  /** Free admissions after both family and global broker limits (not host/provider capacity). */
+  /** Free admissions after family/global broker limits and optional host RAM guard (not provider quota). */
   admissibleWorkerSlots: number;
 }
 
@@ -1603,11 +1604,25 @@ function globalOccupiedWorkerSlots(): number {
   return occupied;
 }
 
-/** Remaining broker-wide worker admissions, or Infinity while the opt-in cap is disabled. */
+/** Pending invitations/revivals reserve estimated memory before their browser work starts.
+ * Count unpublished stages too, so independent owners cannot reserve the same headroom.
+ */
+function hostFreeWorkerSlots(): number {
+  if (!getConfig().multiAgent.hostMemoryGuard) return Infinity;
+  let pending = 0;
+  for (const run of runs.values()) {
+    for (const agent of run.agents.values()) {
+      if (agent.info.role === 'worker' && (agent.info.state === 'invited' || agent.info.state === 'waking')) pending++;
+    }
+  }
+  return hostMemoryAdmissionSlots(true, pending);
+}
+
+/** Remaining admissions after the existing global cap and optional host RAM guard. */
 function globalFreeWorkerSlots(): number {
   const limit = getConfig().multiAgent.globalMaxWorkers ?? 0;
-  if (limit <= 0) return Number.POSITIVE_INFINITY;
-  return Math.max(0, limit - globalOccupiedWorkerSlots());
+  const configured = limit <= 0 ? Infinity : Math.max(0, limit - globalOccupiedWorkerSlots());
+  return Math.min(configured, hostFreeWorkerSlots());
 }
 
 /**
@@ -2343,6 +2358,12 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
     );
   }
 
+  if (planned.length > hostFreeWorkerSlots()) {
+    if (resumedDormant) parkRun(run, 'a new spawn was rejected by the host RAM admission guard');
+    else if (createdFreshRun) runs.delete(run.runId);
+    throw new AgentError('HOST_MEMORY_LIMIT: insufficient estimated host RAM for new workers. Wait for capacity; no new worker was accepted.');
+  }
+
   const ids: string[] = [];
   // Historical rows are intentionally never reused or deleted merely because the worker is
   // asleep/terminal. The old fixed 64-id scan therefore became a lifetime cap on one prime,
@@ -2822,11 +2843,14 @@ function stageMessagesActive(
           );
         }
         const globalMax = getConfig().multiAgent.globalMaxWorkers ?? 0;
-        if (globalMax > 0 && globalFreeWorkerSlots() - reserved.size <= 0) {
+        if (globalMax > 0 && globalMax - globalOccupiedWorkerSlots() - reserved.size <= 0) {
           throw new AgentError(
             `GLOBAL_WORKER_LIMIT: ${toId} is asleep and all ${globalMax} globally admitted worker slots are busy, so it ` +
               `cannot be woken right now${where}. Nothing was sent. Wait for a worker to stop and try again.`
           );
+        }
+        if (hostFreeWorkerSlots() - reserved.size <= 0) {
+          throw new AgentError('HOST_MEMORY_LIMIT: insufficient estimated host RAM to wake this worker. Nothing was sent.');
         }
         // Chats working at once (#1694): a woken worker is a working chat again.
         const chatsAtOnce = workerSlotsRefusal(caller.conversationId ?? null, [workerSlotKey(run?.runId ?? to.info.workerAllocationRunId ?? '', to.info.id)]);

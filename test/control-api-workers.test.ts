@@ -198,6 +198,20 @@ it('lets a local orchestrator spawn real broker workers without a ChatGPT prime 
   expect(broker.primeConversation(result.body.runId)).toBeNull();
 });
 
+it('reads a worker delegation proposal through the authenticated owner inbox without spawning a child', async () => {
+  const modulePath = '../scripts/ecom-cos-native-delegation.mjs';
+  const { readNativeCosDelegationRequests } = await import(modulePath);
+  const spawn = (await worker('spawn', { ownerId, workers: [{ task: 'Propose an independent verification.' }] })).body;
+  expect(broker.bindConversation('worker-1', 'delegation-fixture-worker', spawn.runId)).toBe(true);
+  broker.sendMessage({ conversationId: 'delegation-fixture-worker', runId: spawn.runId }, 'prime',
+    'ECOM_DELEGATION_V1\n' + JSON.stringify({ label: 'Verifier', task: 'Check the fixture.' }));
+  const proof = await readNativeCosDelegationRequests({ localOwnerId: ownerId, familyId: spawn.runId, userDataPath: directory });
+  expect(proof.proposals).toMatchObject([{ parentWorkerId: 'worker-1', familyId: spawn.runId,
+    child: { label: 'Verifier', task: 'Check the fixture.' }, state: 'PROPOSED', requiresCanonicalApproval: true, dispatched: false }]);
+  expect(proof.canonicalMissionAck).toBe(false);
+  expect((await worker('status', { ownerId, runId: spawn.runId })).body.workers).toHaveLength(1);
+});
+
 it('dispatches through the controller adapter against the real authenticated native HTTP broker', async () => {
   // The canonical decision here is a test fixture only, not a production mission lease.
   const modulePath = '../scripts/ecom-cos-native-dispatch.mjs';

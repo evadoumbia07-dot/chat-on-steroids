@@ -212,6 +212,39 @@ it('reads a worker delegation proposal through the authenticated owner inbox wit
   expect((await worker('status', { ownerId, runId: spawn.runId })).body.workers).toHaveLength(1);
 });
 
+it('dispatches an approved worker delegation through the real native broker once and retains parent receipt', async () => {
+  const readModule = '../scripts/ecom-cos-native-delegation.mjs';
+  const dispatchModule = '../scripts/ecom-cos-native-delegation-dispatch.mjs';
+  const { readNativeCosDelegationRequests } = await import(readModule);
+  const { dispatchApprovedNativeCosDelegation } = await import(dispatchModule);
+  const spawn = (await worker('spawn', { ownerId, workers: [{ task: 'Request independent verification.' }] })).body;
+  expect(broker.bindConversation('worker-1', 'delegation-dispatch-fixture', spawn.runId)).toBe(true);
+  broker.sendMessage({ conversationId: 'delegation-dispatch-fixture', runId: spawn.runId }, 'prime',
+    'ECOM_DELEGATION_V1\n' + JSON.stringify({ label: 'Verifier', task: 'Check the fixture.' }));
+  const native = { localOwnerId: ownerId, familyId: spawn.runId, userDataPath: directory };
+  const proposal = (await readNativeCosDelegationRequests(native)).proposals[0];
+  const reservations = new Set<string>();
+  const receipts: unknown[] = [];
+  // Fixture callbacks model the controller contract, not live canonical approval.
+  const options = { ...native, originalMissionId: 'umi-' + 'a'.repeat(24),
+    leaseId: 'fixture-lease', canonicalRevision: 'fixture-revision',
+    reportId: proposal.reportId, proposalDigest: proposal.proposalDigest,
+    reserveCanonical: async (scope: any) => {
+      if (reservations.has(scope.idempotencyKey)) return { state: 'DENIED' };
+      reservations.add(scope.idempotencyKey);
+      return { state: 'RESERVED', reservationId: 'fixture-reservation',
+        idempotencyKey: scope.idempotencyKey, proposalDigest: scope.proposalDigest };
+    },
+    assertCanonical: async () => true,
+    recordCanonicalDispatch: async (receipt: unknown) => { receipts.push(receipt); return true; } };
+  const receipt = await dispatchApprovedNativeCosDelegation(options);
+  expect(receipt).toMatchObject({ parentWorkerId: 'worker-1', childWorkerId: 'worker-2',
+    familyId: spawn.runId, state: 'DISPATCHED', canonicalMissionAck: false });
+  expect(receipts).toHaveLength(1);
+  await expect(dispatchApprovedNativeCosDelegation(options)).rejects.toThrow('RESERVATION_REQUIRED_OR_ALREADY_USED');
+  expect((await worker('status', { ownerId, runId: spawn.runId })).body.workers).toHaveLength(2);
+});
+
 it('dispatches through the controller adapter against the real authenticated native HTTP broker', async () => {
   // The canonical decision here is a test fixture only, not a production mission lease.
   const modulePath = '../scripts/ecom-cos-native-dispatch.mjs';

@@ -198,6 +198,42 @@ it('lets a local orchestrator spawn real broker workers without a ChatGPT prime 
   expect(broker.primeConversation(result.body.runId)).toBeNull();
 });
 
+it('dispatches through the controller adapter against the real authenticated native HTTP broker', async () => {
+  // The canonical decision here is a test fixture only, not a production mission lease.
+  const modulePath = '../scripts/ecom-cos-native-dispatch.mjs';
+  const { dispatchNativeCosWorker } = await import(modulePath);
+  const scopes: Array<{ localOwnerId: string; familyId: string | null; action: string; body: string }> = [];
+  const calls: string[] = [];
+  const options = {
+    localOwnerId: ownerId, familyId: null, userDataPath: directory,
+    action: 'spawn', payload: { workers: [{ task: 'Isolated broker acceptance fixture.' }] },
+    assertCanonical: async (scope: typeof scopes[number]) => { scopes.push(scope); return true; },
+    request: async (url: string, opts: RequestInit) => { calls.push(opts.method!); return fetch(url, opts); }
+  };
+  await expect(dispatchNativeCosWorker({ ...options, assertCanonical: async () => false }))
+    .rejects.toThrow('ECOM_CANONICAL_DISPATCH_DENIED');
+  expect(calls).toEqual([]);
+  const first = await dispatchNativeCosWorker(options);
+  expect(first).toMatchObject({ state: 'DISPATCHED', localOwnerId: ownerId,
+    workerIds: ['worker-1'], canonicalMissionAck: false });
+  expect(calls).toEqual(['GET', 'POST', 'GET']);
+  expect(scopes).toHaveLength(3);
+  expect(scopes.every(scope => scope === scopes[0] && Object.isFrozen(scope))).toBe(true);
+  expect(broker.primeConversation(first.runId)).toBeNull();
+  expect(broker.bindConversation('worker-1', 'controller-fixture-worker', first.runId)).toBe(true);
+  broker.finishAgent({ conversationId: 'controller-fixture-worker' }, 'Fixture report only.');
+  broker.releaseQuiescentRun({ allowPendingReports: true }, first.runId);
+  const reports = await worker('reports', { ownerId, runId: first.runId });
+  expect(reports.body.messages).toMatchObject([{ from: 'worker-1', text: expect.stringContaining('Fixture report only.') }]);
+  const wake = await dispatchNativeCosWorker({ ...options, familyId: first.familyId, action: 'message',
+    payload: { messages: [{ to: 'worker-1', text: 'Isolated follow-up fixture.' }] } });
+  expect(wake.familyId).toBe(first.familyId);
+  expect(wake.runId).not.toBe(first.runId);
+  expect(wake.workerIds).toEqual(['worker-1']);
+  expect(wake.canonicalMissionAck).toBe(false);
+  expect(calls).toEqual(['GET', 'POST', 'GET', 'GET', 'POST', 'GET']);
+});
+
 it('collects exact worker reports across parking, explicitly acknowledges them, and reuses the sleeper', async () => {
   const spawn = (await worker('spawn', { ownerId, workers: [{ task: 'First assignment.' }] })).body;
   broker.bindConversation('worker-1', 'local-worker-chat', spawn.runId);

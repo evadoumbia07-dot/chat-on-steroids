@@ -57,3 +57,23 @@ test('lost POST is unknown effect, never a retry',async()=>{
   await assert.rejects(dispatchNativeCosWorker(options),/COS_NATIVE_DISPATCH_UNKNOWN_EFFECT/);
   assert.equal(calls.filter(c=>c.method==='POST').length,1);
 });
+
+test('control API restart before POST never transfers the approved operation',async()=>{
+  const {calls,options}=fixture();
+  let rotated=false;
+  const read=options.readFile, lease=options.assertCanonical;
+  options.readFile=p=>rotated&&p.endsWith('/token')?'replacement-token-after-restart-123':read(p);
+  let checks=0;
+  options.assertCanonical=async scope=>{const ok=await lease(scope);if(++checks===2)rotated=true;return ok;};
+  await assert.rejects(dispatchNativeCosWorker(options),/COS_NATIVE_CONTROL_API_CHANGED/);
+  assert.deepEqual(calls.map(c=>c.method),['GET']);
+});
+test('control API restart after POST is unknown effect with no replay',async()=>{
+  const {calls,options}=fixture();
+  let rotated=false;
+  const request=options.request, read=options.readFile;
+  options.readFile=p=>rotated&&p.endsWith('/token')?'replacement-token-after-restart-123':read(p);
+  options.request=async(url,opts)=>{const response=await request(url,opts);if(opts.method==='POST')rotated=true;return response;};
+  await assert.rejects(dispatchNativeCosWorker(options),/COS_NATIVE_DISPATCH_UNKNOWN_EFFECT/);
+  assert.deepEqual(calls.map(c=>c.method),['GET','POST']);
+});

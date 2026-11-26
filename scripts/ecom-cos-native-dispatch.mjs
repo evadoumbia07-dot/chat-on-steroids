@@ -31,7 +31,36 @@ export async function dispatchNativeCosWorker({
     if (await assertCanonical(scope) !== true) fail('ECOM_CANONICAL_DISPATCH_DENIED');
   };
   await assertLease();
-  const options = {localOwnerId, userDataPath, readFile, request};
+  // Pin the actual control API incarnation across preflight, POST and readback.
+  // A restart rotates the token; never silently redirect an approved operation
+  // to a different process or use a new credential to explain an old receipt.
+  const directoryPath = path.join(userDataPath, 'control-api');
+  const endpointPath = path.join(directoryPath, 'endpoint.json');
+  const tokenPath = path.join(directoryPath, 'token');
+  const readIncarnation = () => {
+    let endpoint, token;
+    try {
+      endpoint = JSON.parse(readFile(endpointPath, 'utf8'));
+      token = readFile(tokenPath, 'utf8').trim();
+    } catch { fail('COS_NATIVE_CONTROL_API_UNAVAILABLE'); }
+    if (endpoint?.protocol !== 1 || !Number.isInteger(endpoint.port) ||
+        endpoint.port < 1 || endpoint.port > 65535 || !Number.isInteger(endpoint.pid) ||
+        endpoint.pid < 1 || !/^[A-Za-z0-9_-]{20,256}$/.test(token))
+      fail('COS_NATIVE_CONTROL_API_INVALID');
+    return { endpoint, token };
+  };
+  const { endpoint, token } = readIncarnation();
+  const assertIncarnation = () => {
+    const current = readIncarnation();
+    if (current.endpoint.port !== endpoint.port || current.endpoint.pid !== endpoint.pid ||
+        current.token !== token) fail('COS_NATIVE_CONTROL_API_CHANGED');
+  };
+  const pinnedRead = file => {
+    if (file === endpointPath) return JSON.stringify(endpoint);
+    if (file === tokenPath) return token;
+    fail('COS_NATIVE_CONTROL_API_INVALID');
+  };
+  const options = {localOwnerId, userDataPath, readFile: pinnedRead, request};
   const before = await readNativeCosOwnerStatus({...options, expectedRunId: familyId ?? undefined});
   const directory = before.familyDirectory;
   if (!directory || directory.selectionRequired ||
@@ -45,17 +74,8 @@ export async function dispatchNativeCosWorker({
       body.messages.length > 16 || body.messages.some(m => !before.workers.some(w =>
         w.id === m?.to && (w.state === 'active' || w.state === 'sleeping')))))
     fail('COS_NATIVE_WORKER_SELECTION_REQUIRED');
-  const directoryPath = path.join(userDataPath,'control-api');
-  let endpoint, token;
-  try {
-    endpoint = JSON.parse(readFile(path.join(directoryPath,'endpoint.json'),'utf8'));
-    token = readFile(path.join(directoryPath,'token'),'utf8').trim();
-  } catch { fail('COS_NATIVE_CONTROL_API_UNAVAILABLE'); }
-  if (endpoint?.protocol !== 1 || !Number.isInteger(endpoint.port) ||
-      endpoint.port < 1 || endpoint.port > 65535 || !Number.isInteger(endpoint.pid) ||
-      endpoint.pid < 1 || !/^[A-Za-z0-9_-]{20,256}$/.test(token))
-    fail('COS_NATIVE_CONTROL_API_INVALID');
   await assertLease();
+  assertIncarnation();
   // Once a POST is attempted, even a timeout or malformed response is an
   // UNKNOWN_EFFECT until the canonical owner reconciles. Never replay here.
   try {
@@ -67,6 +87,7 @@ export async function dispatchNativeCosWorker({
     if (response?.status !== 202) fail('COS_NATIVE_DISPATCH_UNKNOWN_EFFECT');
     const receipt = await response.json();
     if (!UUID.test(receipt?.runId ?? '')) fail('COS_NATIVE_DISPATCH_UNKNOWN_EFFECT');
+    assertIncarnation();
     const after = await readNativeCosOwnerStatus({...options,expectedRunId:familyId ?? receipt.runId});
     if (!after.familyDirectory || after.activeRunId !== receipt.runId ||
         after.familyDirectory.selectedFamilyId !== (familyId ?? receipt.runId))
@@ -75,6 +96,7 @@ export async function dispatchNativeCosWorker({
     if (!Array.isArray(ids) || !ids.length || ids.some(id => !WORKER.test(id) ||
       !after.workers.some(w => w.id === id))) fail('COS_NATIVE_DISPATCH_UNKNOWN_EFFECT');
     await assertLease();
+    assertIncarnation();
     return {state:'DISPATCHED',localOwnerId,familyId:after.familyDirectory.selectedFamilyId,
       runId:receipt.runId,workerIds:[...new Set(ids)],canonicalMissionAck:false};
   } catch { fail('COS_NATIVE_DISPATCH_UNKNOWN_EFFECT'); }

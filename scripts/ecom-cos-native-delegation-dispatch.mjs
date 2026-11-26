@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { readNativeCosDelegationRequests } from './ecom-cos-native-delegation.mjs';
 import { dispatchNativeCosWorker } from './ecom-cos-native-dispatch.mjs';
 
@@ -30,7 +31,42 @@ export async function dispatchApprovedNativeCosDelegation({
      !HEX.test(proposalDigest??'') || typeof reserveCanonical!=='function' ||
      typeof assertCanonical!=='function' || typeof recordCanonicalDispatch!=='function')
     fail('ECOM_DELEGATION_CANONICAL_SCOPE_REQUIRED');
-  const native={localOwnerId,familyId,userDataPath,readFile,request};
+  if(typeof userDataPath!=='string'||!path.isAbsolute(userDataPath))
+    fail('ECOM_DELEGATION_NATIVE_PATH_INVALID');
+  // Pin discovery, reservation and dispatch to one native incarnation.
+  // The lower-level adapter also pins its own dispatch; that alone does
+  // not protect the earlier proposal discovery across a broker restart.
+  const epPath=path.join(userDataPath,'control-api','endpoint.json');
+  const tokenPath=path.join(userDataPath,'control-api','token');
+  const incarnation=()=>{
+    try{
+      const ep=JSON.parse(readFile(epPath,'utf8'));
+      const token=readFile(tokenPath,'utf8').trim();
+      if(ep?.protocol!==1||!Number.isInteger(ep.pid)||ep.pid<1||
+         !Number.isInteger(ep.port)||ep.port<1||ep.port>65535||
+         !/^[A-Za-z0-9_-]{20,256}$/.test(token))throw Error();
+      return {ep,token};
+    }catch{fail('ECOM_DELEGATION_NATIVE_ENDPOINT_UNAVAILABLE');}
+  };
+  const initial=incarnation();
+  const assertIncarnation=()=>{
+    const now=incarnation();
+    if(now.ep.pid!==initial.ep.pid||now.ep.port!==initial.ep.port||
+       now.token!==initial.token)fail('ECOM_DELEGATION_NATIVE_INCARNATION_CHANGED');
+  };
+  const pinnedRead=file=>{
+    assertIncarnation();
+    if(file===epPath)return JSON.stringify(initial.ep);
+    if(file===tokenPath)return initial.token;
+    fail('ECOM_DELEGATION_NATIVE_ENDPOINT_INVALID');
+  };
+  const native={localOwnerId,familyId,userDataPath,readFile:pinnedRead,
+    async request(url,options){
+      assertIncarnation();
+      const response=await request(url,options);
+      assertIncarnation();
+      return response;
+    }};
   // Derive parent and child from authenticated report, not a model argument.
   const readProposal=async()=>{
     const report=await readNativeCosDelegationRequests(native);
@@ -46,6 +82,7 @@ export async function dispatchApprovedNativeCosDelegation({
     familyId,parentWorkerId:proposal.parentWorkerId,reportId,proposalDigest,idempotencyKey,child});
   // No POST unless a fresh durable reservation was returned. Unknown reserve
   // outcomes must be reconciled in the existing controller before any retry.
+  assertIncarnation();
   let reserved;
   try { reserved=await reserveCanonical(scope); }
   catch { fail('ECOM_DELEGATION_RESERVATION_UNKNOWN_EFFECT'); }
@@ -58,6 +95,7 @@ export async function dispatchApprovedNativeCosDelegation({
   const expectedBody=JSON.stringify(payload);
   let dispatch;
   try {
+    assertIncarnation();
     dispatch=await dispatchNativeCosWorker({...native,action:'spawn',payload,
       async assertCanonical(operation){
         if(operation.localOwnerId!==localOwnerId || operation.familyId!==familyId ||
@@ -73,8 +111,10 @@ export async function dispatchApprovedNativeCosDelegation({
       fail('ECOM_DELEGATION_NATIVE_RECEIPT_INVALID');
     const receipt=Object.freeze({...authorization,runId:dispatch.runId,
       childWorkerId:dispatch.workerIds[0],state:'DISPATCHED',canonicalMissionAck:false});
+    assertIncarnation();
     if(await recordCanonicalDispatch(receipt)!==true)
       fail('ECOM_DELEGATION_CANONICAL_RECEIPT_UNVERIFIED');
+    assertIncarnation();
     return receipt;
   } catch {
     // Includes a rejected admission after reservation, lost POST reply or

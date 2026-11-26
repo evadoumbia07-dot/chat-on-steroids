@@ -62,3 +62,26 @@ test('unknown native effect or missing canonical receipt holds reservation, no r
    assert.equal(x.calls.filter(c=>c.method==='POST').length,1);
  }
 });
+
+test('broker rotation after proposal approval cannot dispatch on the new incarnation',async()=>{
+ const x=await fixture();
+ let rotated=false;
+ const read=x.options.readFile, reserve=x.options.reserveCanonical;
+ x.options.readFile=file=>rotated&&file.endsWith('endpoint.json')
+   ?JSON.stringify({protocol:1,pid:43,port:4243}):read(file);
+ x.options.reserveCanonical=async scope=>{const r=await reserve(scope);rotated=true;return r;};
+ await assert.rejects(dispatchApprovedNativeCosDelegation(x.options),/RECONCILIATION_REQUIRED/);
+ assert.equal(x.calls.filter(c=>c.method==='POST').length,0);
+ assert.equal(x.receipts.length,0);
+});
+test('broker rotation after native POST holds reservation and does not record an unverified receipt',async()=>{
+ const x=await fixture();
+ let rotated=false;
+ const read=x.options.readFile, request=x.options.request;
+ x.options.readFile=file=>rotated&&file.endsWith('endpoint.json')
+   ?JSON.stringify({protocol:1,pid:43,port:4243}):read(file);
+ x.options.request=async(url,opts)=>{const r=await request(url,opts);if(opts.method==='POST')rotated=true;return r;};
+ await assert.rejects(dispatchApprovedNativeCosDelegation(x.options),/RECONCILIATION_REQUIRED/);
+ assert.equal(x.calls.filter(c=>c.method==='POST').length,1);
+ assert.equal(x.receipts.length,0);
+});

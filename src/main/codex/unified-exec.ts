@@ -252,6 +252,9 @@ const POST_EXIT_CLOSE_WAIT_CAP_MS = 50;
 const WATCH_EXIT_QUIET_MS = 150;
 const WATCH_EXIT_QUIET_CAP_MS = 1_000;
 export const MAX_COMPLETED_EXEC_RESULTS = 64;
+// Completed but unacknowledged results no longer consume live terminal slots.
+// Bound the combined backlog as well; never evict owed output to make room.
+export const MAX_OUTSTANDING_EXEC_RESULTS = 128;
 export const COMPLETED_EXEC_OUTPUT_BYTES = 256 * 1024;
 
 /** Applies `UNIFIED_EXEC_ENV` over the caller's environment, as `apply_unified_exec_env`. */
@@ -784,7 +787,7 @@ export class UnifiedExecProcessManager {
   allocateProcessId(draw: () => number = () => randomInt(1_000, 100_000)): number {
     for (;;) {
       const processId = draw();
-      if (this.reservedProcessIds.has(processId) || this.completed.has(processId)) continue;
+      if (this.reservedProcessIds.has(processId) || this.processes.has(processId) || this.completed.has(processId)) continue;
       this.reservedProcessIds.add(processId);
       return processId;
     }
@@ -796,6 +799,18 @@ export class UnifiedExecProcessManager {
     this.completed.delete(processId);
     this.releaseListener?.(processId);
     this.notifyProcessChange();
+  }
+
+  /** Release only the live-slot reservation, retaining exact ownership, output and exit
+   * status until the existing receipt/poll path acknowledges it. No active child is killed. */
+  private retireLiveSlot(entry: ProcessEntry): boolean {
+    if (this.processes.get(entry.processId) !== entry || entry.initialExecCommandActive ||
+        !entry.process.hasExited() || !entry.process.outputClosed) return false;
+    return this.reservedProcessIds.delete(entry.processId);
+  }
+
+  private sweepExitedSlots(): void {
+    for (const entry of this.processes.values()) this.retireLiveSlot(entry);
   }
 
   private retainCompleted(entry: ProcessEntry): void {
@@ -859,10 +874,19 @@ export class UnifiedExecProcessManager {
         initialExecCommandActive: true,
         classifyExit: request.classifyExit, batchMarker: request.batchMarker
       });
-      void process.completion.then(
-        () => this.notifyProcessChange(),
-        () => this.notifyProcessChange()
-      );
+      void process.completion.then(async () => {
+        const entry = this.processes.get(request.processId);
+        if (!entry || entry.process !== process) return;
+        // A pipe can exit before its last bytes arrive. Wait for actual stream closure,
+        // not an arbitrary idle TTL. Admission also sweeps completed entries synchronously.
+        this.notifyProcessChange();
+        if (!process.outputClosed) {
+          const closed = process.outputClosedNotify.notified();
+          try { await closed.promise; }
+          finally { closed.dispose(); }
+        }
+        if (this.retireLiveSlot(entry)) this.notifyProcessChange();
+      }).catch(() => this.notifyProcessChange());
     }
 
     const deadline = start + clampYieldTime(request.yieldTimeMs);
@@ -926,7 +950,10 @@ export class UnifiedExecProcessManager {
     };
     if (responseProcessId !== null) {
       const entry = this.processes.get(request.processId);
-      if (entry?.process === process) entry.initialExecCommandActive = false;
+      if (entry?.process === process) {
+        entry.initialExecCommandActive = false;
+        if (this.retireLiveSlot(entry)) this.notifyProcessChange();
+      }
     }
     return response;
   }
@@ -1207,7 +1234,7 @@ export class UnifiedExecProcessManager {
 
   async terminateAllProcesses(): Promise<void> {
     const entries = [...this.processes.values()];
-    for (const id of new Set([...this.reservedProcessIds, ...this.completed.keys()])) this.releaseListener?.(id);
+    for (const id of new Set([...this.reservedProcessIds, ...this.processes.keys(), ...this.completed.keys()])) this.releaseListener?.(id);
     this.completed.clear();
     this.processes.clear();
     this.reservedProcessIds.clear();
@@ -1231,13 +1258,20 @@ export class UnifiedExecProcessManager {
     return { kind: 'alive', exitCode, processId: entry.processId };
   }
 
-  /** Capacity is admission, never garbage collection: every retained row still owes output. */
+  /** Admission separates live capacity from unread results; neither may grow without bound. */
   private ensureProcessCapacity(requestProcessId: number): void {
+    this.sweepExitedSlots();
+    const archivedUnread = [...this.processes.keys()].filter(id => !this.reservedProcessIds.has(id)).length;
+    if (this.reservedProcessIds.size + archivedUnread > MAX_OUTSTANDING_EXEC_RESULTS) {
+      throw UnifiedExecError.createProcess(
+        `too many outstanding terminal results (limit ${MAX_OUTSTANDING_EXEC_RESULTS}); read retained results before starting another`
+      );
+    }
     // Reservations participate in the hard cap, so concurrent exec_command calls cannot
     // each observe one free slot and collectively insert a 65th live process.
     if (this.reservedProcessIds.size > MAX_UNIFIED_EXEC_PROCESSES) {
       throw UnifiedExecError.createProcess(
-        `too many retained terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES}); drain a returned session with write_stdin before starting another`
+        `too many live or draining terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES}); wait for completion or drain a returned session before starting another`
       );
     }
     if (!this.reservedProcessIds.has(requestProcessId)) {

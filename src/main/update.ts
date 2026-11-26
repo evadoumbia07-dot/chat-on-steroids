@@ -47,10 +47,11 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { app } from 'electron';
 import { logInfo, logWarn } from './logger.js';
-import { APP_VERSION } from './version.js';
+import { APP_VERSION, CUSTOM_RELEASE_REPO } from './version.js';
 import { isNewer, type UpdateStatus } from '../shared/types.js';
 
-const REPO = 'totec448-spec/chat-on-steroids';
+// ECOM OS fork: never stage an official upstream installer over our custom build.
+const REPO = CUSTOM_RELEASE_REPO;
 const LATEST_RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`;
 
 const CHECK_TIMEOUT_MS = 15_000;
@@ -438,7 +439,9 @@ async function latestVersionFromPage(): Promise<string> {
   if (!response.ok) throw new Error(`the release page answered ${response.status}`);
   let landed: URL | null = null;
   try { landed = new URL(response.url); } catch { landed = null; }
-  const tag = landed?.origin === 'https://github.com' ? /\/releases\/tag\/([^/]+)$/.exec(landed.pathname)?.[1] : undefined;
+  const prefix = '/' + REPO + '/releases/tag/';
+  const tag = landed?.origin === 'https://github.com' && landed.pathname.startsWith(prefix)
+    ? landed.pathname.slice(prefix.length) : undefined;
   const version = releaseVersion(tag ? decodeURIComponent(tag) : undefined);
   if (!version) throw new Error('the release page named no usable version tag');
   return version;

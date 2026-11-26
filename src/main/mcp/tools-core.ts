@@ -981,12 +981,6 @@ export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: 
               );
             }
 
-            const processId = unifiedExecManager.allocateProcessId();
-            // Process ids are deliberately small/reusable, while chat ownership lives in a
-            // separate registry. Clear any stale row at the allocation boundary so a recycled
-            // id cannot briefly authorize its previous chat before this call publishes the new owner.
-            forgetExecOwner(processId);
-
             const ripgrep = server ? null : locateRipgrep();
             // A server command is one ssh connection of its own; the folder and login shell are
             // set up on the server by `remoteCommand`, so the local side only needs somewhere to run.
@@ -995,6 +989,12 @@ export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: 
               : deriveExecArgs(shell,
                 withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
             await validatedWorkspace();
+            const environment = execChildEnvironment();
+            const cwd = server ? os.tmpdir() : dir.real;
+            // No awaited or potentially failing workspace/shell preparation after reserving
+            // an id: a rejected validation used to leak one of the 64 slots forever.
+            const processId = unifiedExecManager.allocateProcessId();
+            forgetExecOwner(processId);
             const output = await unifiedExecManager.execCommand({
               classifyExit: (exitCode, rawOutput) => {
                 if (!batch) return nonZeroExitIsBenign(boundCommand, exitCode, rawOutput);
@@ -1011,9 +1011,9 @@ export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: 
               yieldTimeMs: input.yield_time_ms ?? DEFAULT_EXEC_YIELD_TIME_MS,
               maxOutputTokens: undefined,
               truncationPolicy: EXEC_OUTPUT_CEILING_POLICY,
-              cwd: server ? os.tmpdir() : dir.real,
+              cwd,
               displayCwd: dir.virtual,
-              env: execChildEnvironment(),
+              env: environment,
               tty: input.tty ?? DEFAULT_TTY
             });
             // Which exact session or temporary request principal may later write to this

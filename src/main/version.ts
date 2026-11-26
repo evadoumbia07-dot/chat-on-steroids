@@ -14,12 +14,15 @@
 
 export const APP_VERSION = '2.1.55';
 
+/** Only our reviewed fork may supply executable app or Chrome extension updates. */
+export const CUSTOM_RELEASE_REPO = 'evadoumbia07-dot/chat-on-steroids';
+
 /**
  * Standalone extension recovery must stay on the app's own release. Using GitHub's moving
  * `latest` asset can pair an older installed app with a newer, incompatible bridge protocol.
  */
 export function extensionDownloadUrl(version = APP_VERSION): string {
-  return `https://github.com/totec448-spec/chat-on-steroids/releases/download/v${encodeURIComponent(version)}/Chat-On-Steroids-Extension.zip`;
+  return `https://github.com/${CUSTOM_RELEASE_REPO}/releases/download/v${encodeURIComponent(version)}/Chat-On-Steroids-Extension.zip`;
 }
 
 /**

@@ -3,17 +3,28 @@ on:
   pull_request:
     paths:
       - 'src/main/agents.ts'
+      - 'src/main/codex/unified-exec.ts'
+      - 'src/main/mcp/tools-core.ts'
+      - 'src/main/update.ts'
+      - 'src/main/version.ts'
+      - 'test/unified-exec-mutex.test.ts'
+      - 'test/exec-result-delivery.test.ts'
+      - 'test/update.test.ts'
       - 'src/main/agent-admission.ts'
       - 'src/main/ecom-os-admission-adapter.ts'
       - 'src/shared/ecom-os-*.ts'
       - 'test/agents.test.ts'
       - 'test/ecom-os-*.test.ts'
       - '.github/workflows/ecom-os-integration.yml'
+  # Automatic upstream discovery is read-only and runs only from the reviewed default branch.
+  schedule:
+    - cron: '17 4 * * *'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   integration:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -24,4 +35,57 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run typecheck
-      - run: npx vitest run test/ecom-os-admission.test.ts test/ecom-os-admission-adapter.test.ts test/ecom-os-recovery.test.ts test/agents.test.ts --maxWorkers=1
+      - run: npx vitest run test/ecom-os-admission.test.ts test/ecom-os-admission-adapter.test.ts test/ecom-os-recovery.test.ts test/agents.test.ts test/unified-exec-mutex.test.ts test/exec-result-delivery.test.ts test/update.test.ts --maxWorkers=1
+
+  upstream-candidate:
+    # Never run against another user's fork; no repo writes, release publication or deployment.
+    if: github.repository == 'evadoumbia07-dot/chat-on-steroids' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: ecom-cos-upstream-candidate
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Discover and prepare candidate without replacing custom history
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/totec448-spec/chat-on-steroids/releases/latest --jq .tag_name)"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch --no-tags https://github.com/totec448-spec/chat-on-steroids.git "refs/tags/$tag"
+          upstream="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          echo "Upstream stable release: $tag ($upstream)"
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Never rebase/reset/force-push the custom branch. Conflicts stop candidate evaluation.
+          git -c user.name='ECOM OS candidate' -c user.email='candidate@users.noreply.github.com' merge --no-ff --no-commit "$upstream"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+          # Fail if the update channel or terminal cleanup has been removed in the merge.
+          grep -Fq "evadoumbia07-dot/chat-on-steroids" src/main/version.ts
+          grep -Fq "CUSTOM_RELEASE_REPO" src/main/update.ts
+          grep -Fq "retireLiveSlot" src/main/codex/unified-exec.ts
+      - uses: actions/setup-node@v4
+        if: steps.candidate.outputs.needed == 'true'
+        with:
+          node-version: '22'
+          cache: npm
+      - if: steps.candidate.outputs.needed == 'true'
+        run: npm ci --ignore-scripts
+      - if: steps.candidate.outputs.needed == 'true'
+        run: npm run typecheck
+      - if: steps.candidate.outputs.needed == 'true'
+        run: npx vitest run test/ecom-os-admission.test.ts test/ecom-os-admission-adapter.test.ts test/ecom-os-recovery.test.ts test/agents.test.ts test/control-api-workers.test.ts test/unified-exec-mutex.test.ts test/exec-result-delivery.test.ts test/update.test.ts --maxWorkers=1
+      - if: steps.candidate.outputs.needed == 'true'
+        run: node --test test/ecom-cos-*.node.test.mjs
+      - name: Candidate policy
+        if: always()
+        run: echo "Discovery and tests only. A reviewed fork release, rollback and canonical maintenance admission remain required to deploy."

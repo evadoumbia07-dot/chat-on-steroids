@@ -78,7 +78,7 @@ vi.mock('electron', () => ({
 const warnings: string[] = [];
 vi.mock('../src/main/logger.js', () => ({ logInfo: () => undefined, logWarn: (message: string) => warnings.push(message) }));
 
-const { APP_VERSION } = await import('../src/main/version.js');
+const { APP_VERSION, extensionDownloadUrl } = await import('../src/main/version.js');
 const { isNewer } = await import('../src/shared/types.js');
 const {
   applyStagedUpdate,
@@ -134,10 +134,10 @@ function github(options: {
       if (options.fail === 'release') return new Response('nope', { status: 503 });
       return new Response(JSON.stringify({ tag_name: `v${version}` }), { status: 200 });
     }
-    if (url === 'https://github.com/totec448-spec/chat-on-steroids/releases/latest') {
+    if (url === 'https://github.com/evadoumbia07-dot/chat-on-steroids/releases/latest') {
       if (typeof options.page === 'number') return new Response(null, { status: options.page });
       const landed = new Response(null, { status: 200 });
-      Object.defineProperty(landed, 'url', { value: options.page ?? `https://github.com/totec448-spec/chat-on-steroids/releases/tag/v${version}` });
+      Object.defineProperty(landed, 'url', { value: options.page ?? `https://github.com/evadoumbia07-dot/chat-on-steroids/releases/tag/v${version}` });
       return landed;
     }
     if (name === 'SHA256SUMS.txt') {
@@ -199,10 +199,10 @@ describe('the file Get update opens for an installation that cannot update itsel
   });
   it('links that file for the announced version, and the release page otherwise', () => {
     expect(manualDownloadUrl('2.1.17', 'Chat-On-Steroids-macOS-arm64.dmg'))
-      .toBe('https://github.com/totec448-spec/chat-on-steroids/releases/download/v2.1.17/Chat-On-Steroids-macOS-arm64.dmg');
-    expect(manualDownloadUrl(null, 'Chat-On-Steroids-macOS-arm64.dmg')).toBe('https://github.com/totec448-spec/chat-on-steroids/releases/latest');
-    expect(manualDownloadUrl('2.1.17', null)).toBe('https://github.com/totec448-spec/chat-on-steroids/releases/latest');
-    expect(manualDownloadUrl('../evil', 'x.dmg')).toBe('https://github.com/totec448-spec/chat-on-steroids/releases/latest');
+      .toBe('https://github.com/evadoumbia07-dot/chat-on-steroids/releases/download/v2.1.17/Chat-On-Steroids-macOS-arm64.dmg');
+    expect(manualDownloadUrl(null, 'Chat-On-Steroids-macOS-arm64.dmg')).toBe('https://github.com/evadoumbia07-dot/chat-on-steroids/releases/latest');
+    expect(manualDownloadUrl('2.1.17', null)).toBe('https://github.com/evadoumbia07-dot/chat-on-steroids/releases/latest');
+    expect(manualDownloadUrl('../evil', 'x.dmg')).toBe('https://github.com/evadoumbia07-dot/chat-on-steroids/releases/latest');
   });
 });
 
@@ -853,8 +853,9 @@ describe('one pass at a time, and one more next time the app opens', () => {
   });
 
   it('trusts the release page only when it lands on a version tag on github.com', async () => {
-    for (const page of ['https://evil.example/totec448-spec/chat-on-steroids/releases/tag/v9.9.9',
-      'https://github.com/totec448-spec/chat-on-steroids/releases', 404]) {
+    for (const page of ['https://evil.example/evadoumbia07-dot/chat-on-steroids/releases/tag/v9.9.9',
+      'https://github.com/totec448-spec/chat-on-steroids/releases/tag/v9.9.9',
+      'https://github.com/evadoumbia07-dot/chat-on-steroids/releases', 404]) {
       resetUpdateForTests();
       github({ apiStatus: 403, page });
       await asPlatform('win32', undefined, () => checkForUpdates());
@@ -865,7 +866,7 @@ describe('one pass at a time, and one more next time the app opens', () => {
     const { fetch } = github({ fail: 'release' });
     await checkForUpdates();
     expect(updateStatus().error).toContain('503');
-    expect(fetch.mock.calls.map(([url]) => String(url))).not.toContain('https://github.com/totec448-spec/chat-on-steroids/releases/latest');
+    expect(fetch.mock.calls.map(([url]) => String(url))).not.toContain('https://github.com/evadoumbia07-dot/chat-on-steroids/releases/latest');
   });
 
   it('retries the next time the app opens after a download that stopped', async () => {
@@ -1093,9 +1094,9 @@ describe('a check or download that goes wrong on a bad connection', () => {
   it.each(['API', 'public release page', 'artifact'] as const)('explains a rejected %s request, keeps its diagnostic and can retry', async request => {
     const { fetch } = github({ apiStatus: request === 'public release page' ? 403 : undefined });
     const answer = fetch.getMockImplementation()!;
-    const target = request === 'API' ? 'https://api.github.com/repos/totec448-spec/chat-on-steroids/releases/latest'
-      : request === 'public release page' ? 'https://github.com/totec448-spec/chat-on-steroids/releases/latest'
-      : `https://github.com/totec448-spec/chat-on-steroids/releases/download/v${NEXT}/${WINDOWS_ASSET}`;
+    const target = request === 'API' ? 'https://api.github.com/repos/evadoumbia07-dot/chat-on-steroids/releases/latest'
+      : request === 'public release page' ? 'https://github.com/evadoumbia07-dot/chat-on-steroids/releases/latest'
+      : `https://github.com/evadoumbia07-dot/chat-on-steroids/releases/download/v${NEXT}/${WINDOWS_ASSET}`;
     fetch.mockImplementation(async input => {
       if (String(input) === target) {
         throw new TypeError('fetch failed', { cause: new Error('connect ECONNREFUSED') });
@@ -1213,3 +1214,23 @@ describe('a check or download that goes wrong on a bad connection', () => {
   });
 });
 
+
+it('never offers an official upstream binary or Chrome extension from the custom update channel', async () => {
+  const { fetch } = github();
+  await asPlatform('win32', undefined, () => checkForUpdates());
+  expect(updateStatus()).toMatchObject({ latest: NEXT, stage: 'ready' });
+  const urls = fetch.mock.calls.map(([url]) => String(url));
+  expect(urls).toContain('https://api.github.com/repos/evadoumbia07-dot/chat-on-steroids/releases/latest');
+  expect(urls.every(url => !url.includes('totec448-spec/chat-on-steroids'))).toBe(true);
+  expect(extensionDownloadUrl()).toBe('https://github.com/evadoumbia07-dot/chat-on-steroids/releases/download/v'+APP_VERSION+'/Chat-On-Steroids-Extension.zip');
+});
+
+it('keeps the custom installation when the fork has no published release', async () => {
+  const { fetch } = github({ apiStatus: 404 });
+  await asPlatform('win32', undefined, () => checkForUpdates());
+  expect(updateStatus()).toMatchObject({ latest: null, stage: 'failed' });
+  expect(markInstallOnQuit()).toBe(false);
+  expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([
+    'https://api.github.com/repos/evadoumbia07-dot/chat-on-steroids/releases/latest'
+  ]);
+});

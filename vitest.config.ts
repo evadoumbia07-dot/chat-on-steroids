@@ -24,7 +24,11 @@ export default defineConfig({
       // In-process evidence arrives in microseconds or never; the production windows only
       // exist for a real browser that is seconds late. Without this the suite spent minutes
       // waiting out fifteen-second timeouts to prove calls stay unattributed.
-      CLF_EVIDENCE_MS: '1500'
+      // Permit a slower isolated QA host to exercise the exact same proof joins with
+      // more realistic latency. Production still clamps each wait to its own limit.
+      // Keep the original CI default; never disable identity checking for a test.
+      CLF_EVIDENCE_MS: String(Math.max(1500, Math.min(10000,
+        Number(process.env.COS_TEST_EVIDENCE_MS) || 1500)))
     }
   }
 });

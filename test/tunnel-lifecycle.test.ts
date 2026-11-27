@@ -459,6 +459,50 @@ describe('OpenAI tunnel process ownership', () => {
     await handle.stop();
   });
 
+  it('automatically reconnects after a slow retirement, with no second live tunnel', async () => {
+    vi.useFakeTimers();
+    const reports: any[] = [];
+    // The termination request returns, but the child has not exited yet.
+    fixture.terminate.mockImplementationOnce(async () => {});
+    const handle = await startTunnel({
+      localUrl: 'http://127.0.0.1:1234/secret', settings, apiKey: 'sk-tunnel-test',
+      report: report => reports.push(report)
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(65_000);
+      expect(fixture.children).toHaveLength(1);
+      expect(reports.at(-1).state).toBe('tunnel-unavailable');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fixture.children).toHaveLength(1);
+      expect(fixture.terminate).toHaveBeenCalledTimes(1);
+      const old = fixture.children[0];
+      old.exitCode = 0;
+      old.emit('exit', 0);
+      old.emit('close', 0);
+      await vi.advanceTimersByTimeAsync(18_000);
+      expect(fixture.children).toHaveLength(2);
+      expect(fixture.terminate).toHaveBeenCalledTimes(1);
+    } finally { await handle.stop(); }
+  });
+
+  it('honors explicit disconnect even when retirement was not yet observed', async () => {
+    vi.useFakeTimers();
+    fixture.terminate.mockImplementationOnce(async () => {});
+    const handle = await startTunnel({
+      localUrl: 'http://127.0.0.1:1234/secret', settings, apiKey: 'sk-tunnel-test',
+      report: () => undefined
+    });
+    await vi.advanceTimersByTimeAsync(65_000);
+    const old = fixture.children[0];
+    // The actual child has since exited, but the next supervisor tick is pending.
+    old.exitCode = 0;
+    old.emit('exit', 0);
+    old.emit('close', 0);
+    await handle.stop();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(fixture.children).toHaveLength(1);
+  });
+
   it('does not wait on a client that already died by signal before starting its replacement', async () => {
     vi.useFakeTimers();
     const reports: any[] = [];

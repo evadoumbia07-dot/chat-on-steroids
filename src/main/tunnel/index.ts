@@ -495,20 +495,39 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     retirement = (async () => {
       const retired = !terminate || (await stopTree(run.proc));
       if (stopped) return;
+      const scheduleReplacement = (): void => {
+        if (stopped || current) return;
+        timer = setTimeout(() => {
+          timer = null;
+          void launch();
+        }, wait);
+        timer.unref?.();
+      };
       if (!retired) {
-        // Starting B without proof that A stopped would create two owned tunnel trees. Fail
-        // closed and let an explicit reconnect create a fresh supervisor instead.
+        // A slow shutdown is not permission to start a second tunnel. Keep
+        // observing the SAME owned child; no extra kill, process or credential.
+        // Previously this path abandoned recovery even when the child exited
+        // a moment later, forcing a human to reconnect.
         opts.report({
           state: 'tunnel-unavailable',
-          detail: 'The previous tunnel client could not be stopped safely. Disconnect and reconnect to try again.'
+          detail: 'Waiting for the previous tunnel client to stop safely. Reconnection will resume automatically when its exit is confirmed.'
         });
+        const observeRetirement = (): void => {
+          if (stopped || current) return;
+          if (exited(run.proc)) {
+            scheduleReplacement();
+            return;
+          }
+          timer = setTimeout(() => {
+            timer = null;
+            observeRetirement();
+          }, WATCH_INTERVAL_MS);
+          timer.unref?.();
+        };
+        observeRetirement();
         return;
       }
-      timer = setTimeout(() => {
-        timer = null;
-        void launch();
-      }, wait);
-      timer.unref?.();
+      scheduleReplacement();
     })();
   };
 

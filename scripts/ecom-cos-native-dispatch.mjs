@@ -95,9 +95,21 @@ export async function dispatchNativeCosWorker({
     const ids = action === 'spawn' ? receipt.workers?.map(w => w.id) : receipt.queued?.map(m => m.to);
     if (!Array.isArray(ids) || !ids.length || ids.some(id => !WORKER.test(id) ||
       !after.workers.some(w => w.id === id))) fail('COS_NATIVE_DISPATCH_UNKNOWN_EFFECT');
+    // A queued message has its own durable native identity. Do not equate it
+    // with an acknowledgement by the receiving worker or completion of a task.
+    let messageReceipts;
+    if (action === 'message') {
+      if (!Array.isArray(receipt.queued) || receipt.queued.length !== body.messages.length ||
+          receipt.queued.some((m,i) => !/^[0-9a-f]{8}$/.test(m?.id ?? '') ||
+            m.to !== body.messages[i].to) ||
+          new Set(receipt.queued.map(m => m.id)).size !== receipt.queued.length)
+        fail('COS_NATIVE_DISPATCH_UNKNOWN_EFFECT');
+      messageReceipts = receipt.queued.map(m => ({id:m.id,to:m.to}));
+    }
     await assertLease();
     assertIncarnation();
     return {state:'DISPATCHED',localOwnerId,familyId:after.familyDirectory.selectedFamilyId,
-      runId:receipt.runId,workerIds:[...new Set(ids)],canonicalMissionAck:false};
+      runId:receipt.runId,workerIds:[...new Set(ids)],
+      ...(messageReceipts ? {messageReceipts} : {}),canonicalMissionAck:false};
   } catch { fail('COS_NATIVE_DISPATCH_UNKNOWN_EFFECT'); }
 }

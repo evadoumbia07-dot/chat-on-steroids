@@ -54,6 +54,7 @@ import { getChatModels, refreshForUnoffered } from './chat-models.js';
 import { DEFAULT_HELPER_CHAT_MODEL, resolveChatModel } from '../shared/chat-models.js';
 import type { ReasoningEffort } from '../shared/session.js';
 import { writeDurableNow, writeDurableSnapshotSoon, writeDurableSoon } from './durable.js';
+import { automaticLoopStalled } from './goal-loop-stall.js';
 import { goalHelperPromptLimit, noteGoalHelperUnanswered, resetGoalHelperSizeForTests } from './goal-helper-size.js';
 export { GOAL_HELPER_SIZE_STATE, restoreGoalHelperSize } from './goal-helper-size.js';
 import { logInfo, logWarn } from './logger.js';
@@ -177,7 +178,7 @@ export const REQUEST_TIMEOUT_MS = 180_000;
  * belongs to the page's Goal loop, which is the only place that can tell whether the turn is
  * still the one being answered. This is what that loop reads, published as `retryable`.
  */
-const SETTLED_FAILURE = /^(?:auth_rejected|out_of_credit|unknown_model|no_api_key|no_conversation|no_objective|invalid_provider|goal_marker_missing|goal_browser_cancelled|goal_browser_send_unconfirmed|goal_browser_send_failed|goal_helper_stop_unverified)(?:$|:)/;
+const SETTLED_FAILURE = /^(?:auth_rejected|out_of_credit|unknown_model|no_api_key|no_conversation|no_objective|invalid_provider|goal_marker_missing|goal_browser_cancelled|goal_browser_send_unconfirmed|goal_browser_send_failed|goal_helper_stop_unverified|goal_loop_stalled|goal_switch_not_durable)(?:$|:)/;
 
 /** One failure classification shared by ordinary drafts and the conversation-less opening request. */
 function retryableGoalFailure(error: string): boolean {
@@ -2183,6 +2184,16 @@ async function run(draft: GoalDraft): Promise<void> {
     return settle(draft, 'failed', 'no_conversation');
   }
 
+  // ECOM OS: a proven repeat is a pause, never completion. No provider request is made.
+  // Manual activation of this exact obligation is allowed once; human steering resets the detector.
+  const obligation = goalReplies.get(draft.conversationId);
+  const explicitlyActivated = obligation?.sessionId === draft.sessionId &&
+    obligation.turnId === draft.turnId && obligation.state === 'pending' && obligation.explicitActivation === true;
+  if (draft.mode === 'loop' && !explicitlyActivated && loopStallOf.get(messages) === true &&
+      goalSwitchFor(draft.conversationId).mode === 'loop') {
+    return pauseStalledLoop(draft);
+  }
+
   // The step reviewer's answer for this step (#1832): a blocking finding pauses Goal; any other goes
   // after the message, and the helper is told it is there.
   // A review still in progress is waited for (the helper must not decide without it): VM 141, 2026-10-26.
@@ -2835,6 +2846,23 @@ async function pauseForReview(draft: GoalDraft, finding: string): Promise<void> 
   settle(draft, 'no-reply');
 }
 
+async function pauseStalledLoop(draft: GoalDraft): Promise<void> {
+  try {
+    const saved = await setGoalSwitchNow(draft.conversationId, 'loop', false, undefined, 'ECOM OS repeated automatic result guard');
+    if (saved.enabled) return settle(draft, 'failed', 'goal_loop_stalled');
+  } catch {
+    // Failure to persist a stop never authorizes sending another continuation.
+    return settle(draft, 'failed', 'goal_switch_not_durable');
+  }
+  if (draft.acknowledged || drafts.get(draft.conversationId) !== draft) return;
+  const { recordNote } = await import('./session/recorder.js');
+  await recordNote(draft.sessionId, 'Loop paused: three distinct, automatically initiated turns returned the same complete final answer. No completion or provider success was inferred. Review the blocker or give new steering before resuming.').catch(() => undefined);
+  const { noticeChatStopped } = await import('./stuck-notice.js');
+  noticeChatStopped('Loop paused', 'The same final answer was recorded in three automatic rounds. Check the blocker before resuming.', draft.sessionId);
+  draft.reply = '';
+  settle(draft, 'failed', 'goal_loop_stalled');
+}
+
 async function pauseRepeatingGoal(draft: GoalDraft, answer: string): Promise<void> {
   logInfo(`goal: ${draft.conversationId} gave the same answer ${REPEAT_ROUNDS} times in a row; pausing Goal instead of asking again`);
   await setGoalSwitchNow(draft.conversationId, 'goal', false, undefined, 'Goal itself (the same answer repeated)').catch(() => undefined);
@@ -2857,6 +2885,9 @@ const answerBeforeNote = new WeakMap<ChatMessage, string>();
 /** What the Offline marker check reads: the newest answer as written, without the app's own note. */
 /** Assistant messages ChatGPT marked final, as opposed to its commentary (#2007). */
 const finalAnswers = new WeakSet<ChatMessage>();
+const completeFinalAnswers = new WeakSet<ChatMessage>();
+// A bounded projection may omit older rounds; compute the observation before clipping the history.
+const loopStallOf = new WeakMap<readonly ChatMessage[], boolean>();
 /** The turn each recorded assistant message belongs to, where the recording names one. */
 const turnOfMessage = new WeakMap<ChatMessage, string>();
 /**
@@ -3039,7 +3070,12 @@ export async function conversationMessages(sessionId: string, deliveredInput: re
     } else if ((event.kind === 'assistant_message' && (event.final || event.messageId)) || (event.kind === 'progress' && event.source === 'extension')) {
       const content = clip(event.kind === 'assistant_message' ? modelFacingText(event.message.text, event.renderedHtml) : event.message.text);
       if (content) next = { role: 'assistant', content };
-      if (next && event.kind === 'assistant_message' && event.final) finalAnswers.add(next);
+      if (next && event.kind === 'assistant_message' && event.final) {
+        finalAnswers.add(next);
+        if (!event.message.truncated && modelFacingText(event.message.text, event.renderedHtml).trim().length < MAX_MESSAGE_CHARS) {
+          completeFinalAnswers.add(next);
+        }
+      }
       if (next && typeof event.turnId === 'string' && event.turnId) turnOfMessage.set(next, event.turnId);
     }
     if (!next) continue;
@@ -3089,6 +3125,7 @@ export async function conversationMessages(sessionId: string, deliveredInput: re
     const noted = { ...answer, content: `${answer.content}\n\n${toolCallFootnote(count, before)}` };
     answerBeforeNote.set(noted, answerBeforeNote.get(answer) ?? answer.content);
     if (finalAnswers.has(answer)) finalAnswers.add(noted);
+    if (completeFinalAnswers.has(answer)) completeFinalAnswers.add(noted);
     const answerTurn = turnOfMessage.get(answer);
     if (answerTurn) turnOfMessage.set(noted, answerTurn);
     ordered[at] = noted;
@@ -3097,6 +3134,14 @@ export async function conversationMessages(sessionId: string, deliveredInput: re
     const content = clip(userPromptText(text) ?? text, MAX_USER_MESSAGE_CHARS);
     if (content) ordered.push({ role: 'user', content });
   }
+  const loopStalled = automaticLoopStalled(ordered.map(message => ({
+    role: message.role,
+    text: answerBeforeNote.get(message) ?? message.content,
+    automatic: message.origin === 'automatic',
+    final: finalAnswers.has(message),
+    complete: completeFinalAnswers.has(message),
+    turnId: turnOfMessage.get(message)
+  })));
   // A saturated recent read does not prove it reached the start of the conversation. Its first
   // user can merely be the oldest follow-up still inside the tail, which makes the system
   // prompt's "what you originally asked for" instruction false. Resolve the actual first user
@@ -3140,6 +3185,7 @@ export async function conversationMessages(sessionId: string, deliveredInput: re
     ordered.length <= MAX_CONTEXT_MESSAGES &&
     totalChars <= MAX_CONTEXT_CHARS
   ) {
+    loopStallOf.set(ordered, loopStalled);
     return ordered;
   }
 
@@ -3183,6 +3229,7 @@ export async function conversationMessages(sessionId: string, deliveredInput: re
     .map((entry) => entry.message);
   // The Offline marker is read from everything recorded, whatever the cut left out.
   decisionTextOf.set(result, templateDecisionText(ordered));
+  loopStallOf.set(result, loopStalled);
   return result;
 }
 

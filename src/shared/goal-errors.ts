@@ -1,5 +1,6 @@
 /** Presentation only. Keep machine errors and retry/ownership decisions unchanged. */
 const explanations: Readonly<Record<string, string>> = {
+  goal_loop_stalled: 'Loop paused after three identical complete automatic answers. No completion was inferred. Resolve the blocker or provide new instructions before resuming.',
   loop_mcp_call_missing: 'No MCP tool call was recorded in the last response. ChatGPT may be asking you something, or the tool connection may have been lost. Answer it, or check the tunnel if tools stopped working. Automatic continuation is paused; Loop remains enabled.',
   goal_reply_not_pending: 'There is no pending continuation for this answer. It may already have been handled or replaced by newer work. Check the latest chat activity before trying again.',
   goal_context_too_large: 'The task and Goal/Loop instructions are too long to send to the helper. Shorten the task or the custom continuation instructions in Settings.',

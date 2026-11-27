@@ -17,7 +17,7 @@ Read the [responsible-use notice and provider rules](../README.md#responsible-us
 
 Want screen and keyboard control? Enable **Desktop** permissions and connect its separate app. On macOS, also grant Screen Recording and Accessibility in System Settings.
 
-**After an update:** the browser extension updates itself once no chat is busy. If CoS asks you to refresh its apps in ChatGPT, do so; **Automatic plugin refresh** (Settings → Agents & automation → Browser & history) can do it for you.
+**After an update:** the browser extension updates itself once no chat is busy. If CoS asks you to refresh its apps in ChatGPT, do so; **Automatic plugin refresh** (Settings → Browser) can do it for you.
 
 ## Tunnel setup
 
@@ -50,7 +50,7 @@ In these workspaces, the workspace's admins decide who may add custom apps, and 
 
 ## Browser bridge port
 
-In **Settings → Agents & automation → Browser & history → Browser bridge port**, choose **Auto** (default) or
+In **Settings → Browser → Browser bridge port**, choose **Auto** (default) or
 **8765**, **8766**, **8767**, **8768**, **8769**. Auto uses the first available port in that
 order and, when all five are taken, the fallback ranges **18765–18769** and **38765–38769**
 (Windows can reserve whole blocks of ports for Hyper-V, WSL2 or Docker). A fixed choice uses
@@ -69,7 +69,7 @@ comma-separated override and port `0` remain available for isolated development/
 ## Background tabs
 
 With **Background chats** on, the tabs the app opens for workers and recovered chats stay in the
-background. **Settings → Agents & automation → Browser & history → Background tabs open in** chooses where: **Their own
+background. **Settings → Browser → Background tabs open in** chooses where: **Their own
 minimized window** (default) or **A tab group in your browser window**. The tab group is a collapsed
 "Chat On Steroids" group in the window you used last, and it stays there. The app never selects a
 tab or changes the window you are using. Chrome saves open tab groups automatically. The app's
@@ -166,11 +166,38 @@ History is recorded locally and kept until you delete a chat; recording can't be
 
 [Security policy](../SECURITY.md) · [Tool reference](tool-surface.md) · [Architecture](../AGENTS.md)
 
+## Notifications, steps and limits
+
+### Phone notifications
+
+**Settings → Phone notifications.** Turn on **Send notifications to your phone**, then pick **ntfy**, **Telegram**, or both. You choose when a message is sent (a chat needs you, something fails, a chat finishes after some minutes of work), set **Quiet hours**, and can limit it to times you are away. **Send test** sends a message that never contains chat text. Chat names and answers are left out unless you turn on **Include chat names and answers**.
+
+- **ntfy:** install the free ntfy app and subscribe to the topic shown in Settings. Anyone who knows the topic can read the messages, so keep it private.
+- **Telegram, with a bot of your own:** in Telegram, create a bot with @BotFather and copy its token. In Settings, press **Link…** and paste the token (it is kept in secure storage). Send the shown code to your bot from your own account within 10 minutes. The bot then confirms the link. **Unlink** removes the token.
+- **Telegram commands:** `/status` lists what is running or waiting for you. `/stop`, `/pause` and `/resume` act on a chat of yours (reply to its notification to name it; a bare command works when only one chat is meant). Under an approval you can press **Deny**. **Allowing something from the phone does not exist.**
+- **Replies as messages** are off by default. If you turn on **Let replies send messages to chats**, a reply to a notification goes to that chat as your message, and ChatGPT may then run tools on this computer. Anyone who can use your Telegram account could do the same.
+
+### Steps for you
+
+When ChatGPT needs something only you can do (a sign-in, a USB key, a command it must not run), it hands you a **step for you**. It appears in the chat and above the message box with the exact command, the folder and the files it expects. Run it yourself in your own terminal, then press **Mark as done** or **Skip**; ChatGPT is told which. Chat On Steroids never runs or checks the command.
+
+### Chats working at once
+
+**Settings → Workers → Chats working at once** limits how many chats (sub-agents included) work at the same time, from 1 to 10, or **Off**. Messages the app sends by itself (Goal, Loop, an automatic Continue) wait for a free slot. A message you send always goes out.
+
+### Related folders
+
+In a project's **⋯** menu, **Related folders…** adds context folders from your approved folders. ChatGPT is told about them in that project's chats. They never become the working folder and never grant access.
+
+### When a chat has trouble
+
+One row above the message box says what is wrong now, since when, how often the app tried, and each step it took. It turns amber once the app has stopped trying (for example when no browser tab is open for the chat); opening that chat's tab again lets recovery resume.
+
 ## Sessions, workers and Astra
 
 **Session history** belongs to the local session, not a particular ChatGPT tab. The browser extension records messages and the actual local tool results so the app and the model can read earlier work.
 
-**Compact & Resume** asks for a handoff, starts a fresh provider conversation and rebinds that same session. Task and worker history move with it. In Settings → Continuation prompts, **Handoff prompt** controls what the brief emphasizes; the continuation marker and recovery/provenance framing remain fixed. **Handoff length** (Settings → Agents & automation → Browser & history) sets how much it keeps: **Thorough** (the default, about 10k–30k tokens), **Standard** (4k–10k) or **Short** (2k–6k). Automatic compaction uses configured local estimates and eligible live work; Pro models never auto-compact.
+**Compact & Resume** asks for a handoff, starts a fresh provider conversation and rebinds that same session. Task and worker history move with it. In Settings → Goal & Loop → Continuation prompts, **Handoff prompt** controls what the brief emphasizes; the continuation marker and recovery/provenance framing remain fixed. **Handoff length** (Settings → Browser) sets how much it keeps: **Thorough** (the default, about 10k–30k tokens), **Standard** (4k–10k) or **Short** (2k–6k). Automatic compaction uses configured local estimates and eligible live work; Pro models never auto-compact.
 
 **Workers** keep their conversation when they finish. Send a follow-up to reuse one. The default is two simultaneous workers per family, configurable up to eight. Idle owned tabs can be reused or closed after fresh checks; the durable worker history remains. Drafts, active work and pins are protected.
 

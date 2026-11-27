@@ -15,7 +15,7 @@ const CHOOSE_AGAIN = new Set(['Choose the backup file again.', 'Your settings ch
 /** The Settings tab a changed setting is on, so the person can find it; the first match wins. */
 const CATEGORIES: ReadonlyArray<readonly [RegExp, string]> = [
   [/^(capabilities\.|readOnly$|commandAllowlist|projects\.|mcp\.)/, 'Workspace'], [/^ui\.(appearance|theme)/, 'Appearance'],
-  [/^(multiAgent|goal)\./, 'Agents & automation']
+  [/^(multiAgent|goal)\./, 'Agents']
 ];
 const category = (path: string) => CATEGORIES.find(([pattern]) => pattern.test(path))?.[1] ?? 'General';
 
@@ -28,7 +28,7 @@ function widerLabel(path: string): string {
   const labels: Record<string, string> = {
     readOnly: 'Read-only mode off', commandAllowlist: 'Command rules changed', 'controlApi.enabled': 'Local control API on',
     'controlApi.allowActions': 'Local control API actions on', 'multiAgent.strictChatAllowlist': 'Trust only selected chats off',
-    'multiAgent.allowUnattributedCalls': 'Unattributed calls allowed', 'ui.secretsShield': 'Hide secrets from ChatGPT off'
+    'multiAgent.allowUnattributedCalls': 'Unattributed calls allowed', 'ui.linuxDesktopEnabled': 'Native Linux Desktop access on', 'ui.secretsShield': 'Hide secrets from ChatGPT off'
   };
   return labels[path] ? t(labels[path]) : path;
 }

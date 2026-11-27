@@ -1,6 +1,7 @@
 import type { EcomAdmissionSource } from '../ecom-os-admission-adapter.js';
 import { toolDeclaration } from './tool-declarations.js';
 import { registerPlanTool } from './plan-tool.js';
+import { registerUserRequestTools } from './user-request-tools.js';
 import { goalWorkerChat, imageExportCapable } from '../bridge.js';
 import { exportImage, ImageExportError } from '../image-export.js';
 import { awaitRequestCorrelation } from '../session/correlation.js';
@@ -516,8 +517,8 @@ export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: 
             // may send a chat's call to another computer's Core, which never sees that chat (#1097).
             return fail(`${liveConnectorName('core')} could not tell which chat this save_image call came from, ` +
               'so it does not know which image to save. If the chat belongs to another computer, call save_image of that ' +
-              'computer\'s Chat On Steroids Core instead. Otherwise call save_image directly as its own tool call, not from ' +
-              'inside a JavaScript or exec step, and try again.');
+              'computer\'s Chat On Steroids Core instead. Otherwise wait a moment and call save_image once more; calling it ' +
+              'from an exec step is fine. The app ties a call to its chat through the Chat On Steroids extension in that chat\'s browser tab.');
           }
           if (!imageExportCapable()) {
             return fail('save_image needs the Chat On Steroids browser extension to be connected and up to date, so the chat\'s page can hand over the image.');
@@ -980,12 +981,6 @@ export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: 
               );
             }
 
-            const processId = unifiedExecManager.allocateProcessId();
-            // Process ids are deliberately small/reusable, while chat ownership lives in a
-            // separate registry. Clear any stale row at the allocation boundary so a recycled
-            // id cannot briefly authorize its previous chat before this call publishes the new owner.
-            forgetExecOwner(processId);
-
             const ripgrep = server ? null : locateRipgrep();
             // A server command is one ssh connection of its own; the folder and login shell are
             // set up on the server by `remoteCommand`, so the local side only needs somewhere to run.
@@ -994,6 +989,12 @@ export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: 
               : deriveExecArgs(shell,
                 withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
             await validatedWorkspace();
+            const environment = execChildEnvironment();
+            const cwd = server ? os.tmpdir() : dir.real;
+            // No awaited or potentially failing workspace/shell preparation after reserving
+            // an id: a rejected validation used to leak one of the 64 slots forever.
+            const processId = unifiedExecManager.allocateProcessId();
+            forgetExecOwner(processId);
             const output = await unifiedExecManager.execCommand({
               classifyExit: (exitCode, rawOutput) => {
                 if (!batch) return nonZeroExitIsBenign(boundCommand, exitCode, rawOutput);
@@ -1010,9 +1011,9 @@ export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: 
               yieldTimeMs: input.yield_time_ms ?? DEFAULT_EXEC_YIELD_TIME_MS,
               maxOutputTokens: undefined,
               truncationPolicy: EXEC_OUTPUT_CEILING_POLICY,
-              cwd: server ? os.tmpdir() : dir.real,
+              cwd,
               displayCwd: dir.virtual,
-              env: execChildEnvironment(),
+              env: environment,
               tty: input.tty ?? DEFAULT_TTY
             });
             // Which exact session or temporary request principal may later write to this
@@ -1198,6 +1199,13 @@ export function registerCoreTools(reg: SurfaceRegistrar, trustedEcomAdmission?: 
     );
   }
 
+  // A step for the person (#1695): offered with the command tools, and also in Read-only mode,
+  // which turns those off: it runs nothing, and the person's own terminal is theirs.
+  // Kept registered once offered (ToolContext.exposedUserRequests); the handler refuses while off.
+  if (ctx.exposedUserRequests ?? ((exposedCaps.command || (ctx.readOnly && getConfig().capabilities.command)) && reg.sessionToolsExposed)) {
+    registerUserRequestTools(reg);
+  }
+
   // ------------------------------------------------------- plan and finish
 
   if (reg.sessionToolsExposed) {
@@ -1264,7 +1272,7 @@ function registerAgentsTool(reg: SurfaceRegistrar, trustedEcomAdmission?: (calle
     toolDeclaration('agents', () => ({
       title: 'Multi-agent run',
       description:
-        'Runs ChatGPT workers. Without model/reasoning_effort, saved app defaults apply; they are set only for a user’s explicit request. A suitable sleeping worker is reused with message, not respawned. ' +
+        'Runs workers as separate ChatGPT chats, not ChatGPT’s own in-conversation subagents. Without model/reasoning_effort, saved app defaults apply; they are set only for a user’s explicit request. A suitable sleeping worker is reused with message, not respawned. ' +
         'message: prime↔worker. Reports arrive with tool results, not by restarting an idle prime. ' +
         'status: your active, sleeping/revivable and terminal workers, incl. parked families, and pending reports; one call before a final answer collects them. Repeated polling adds nothing. finish: records the report, then normally sleeps.',
       inputSchema: z.object({

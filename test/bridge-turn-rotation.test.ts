@@ -4,6 +4,7 @@
  * a Pro turn and the result of a Goal/Loop hold tool get none.
  */
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('electron', () => ({
@@ -41,6 +42,7 @@ const { findSessionByConversation, initSessionStore, resetSessionStoreForTests }
 const { recordToolCall, resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { listInputs, resetInputForTests } = await import('../src/main/session/input.js');
 const { resetTurnRotationForTests } = await import('../src/main/turn-rotation.js');
+const { owedContinueFor, owedTimerPendingForTests, resetOwedContinuesForTests, setOwedQuietForTests } = await import('../src/main/owed-continue.js');
 const { openCallHold, resetCallHoldsForTests } = await import('../src/main/rotation-hold.js');
 const logger = await import('../src/main/logger.js');
 const { setGoalSwitchNow, resetGoalStateForTests } = await import('../src/main/goal.js');
@@ -162,7 +164,7 @@ beforeEach(async () => {
   resetBridgeForTests();
   resetRecorderForTests();
   resetInputForTests();
-  resetTurnRotationForTests();
+  resetTurnRotationForTests(); resetOwedContinuesForTests();
   resetCallHoldsForTests();
   setRotationHoldForTests(200);
   resetGoalStateForTests();
@@ -308,6 +310,29 @@ describe('turn rotation (#1402)', () => {
 
   // 2026-10-20: when ChatGPT shows Stop it offers no Send for the continue; the page says so at
   // once instead of the call's answer waiting out the hold.
+  // #1922: a continue that never reached Send can stay in ChatGPT's composer. The next claim for that chat
+  // names it, so the page can tell the app's own leftover from the person's draft and replace it.
+  it('names the continue that never reached Send when the next message for that chat is claimed', async () => {
+    setRotationHoldForTests(5_000);
+    const { enqueueInput } = await import('../src/main/session/input.js');
+    const chat = 'f0f00003-1111-4111-8111-000000000207';
+    const sessionId = await turnFor(chat, 'g-rot-hold-7', 31);
+    const answer = (await heldCall(chat))();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const row = (await listInputs()).find(entry => entry.sessionId === sessionId && entry.purpose === 'rotation')!;
+    const page = { id: row.id, owner: 'rotation-page', conversationId: chat };
+    const continued = (await request('POST', '/input/claim', { body: { ...page, requiresAuthorization: true } })).body;
+    // Its own claim lists nothing: a message is never its own leftover.
+    expect(continued.ownUnsent).toBeUndefined();
+    await request('POST', '/input/fail', { body: { ...page, error: 'Fresh-turn continue declined: no Send while ChatGPT works.', detail: 'no-send' } });
+    await answer;
+    await events(chat, [{ kind: 'turn_end', time: Date.now(), turnId: 'g-rot-hold-7', outcome: 'completed' }]);
+    const next = await enqueueInput({ id: randomUUID(), sessionId, text: 'Please also check the logs.', mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null });
+    const claimed = (await request('POST', '/input/claim', { body: { id: next.id, owner: 'next-page', conversationId: chat, requiresAuthorization: true } })).body;
+    expect(claimed.input).toMatchObject({ id: next.id });
+    expect(claimed.ownUnsent).toEqual([continued.input.text]);
+  });
+
   it('answers the call at once when the page declines the continue for want of Send', async () => {
     setRotationHoldForTests(5_000);
     const chat = 'f0f00003-1111-4111-8111-000000000204';
@@ -408,6 +433,77 @@ describe('stop fallback for fresh turns', () => {
       expect(next).not.toHaveProperty('directTurn');
       expect((await request('GET', '/status')).body.inputs.map((input: { id: string }) => input.id)).toContain(next.id);
     } finally { spy.mockRestore(); setRotationHoldForTests(15_000); await saveConfig({ ...config, sessions: { ...config.sessions, record: true } }); }
+  });
+
+  // #2131: the page refused the after-Stop continue before Send ("The composer changed; your draft was
+  // preserved") and nothing filed it again, so the chat sat idle once the stopped request went quiet.
+  it('files the continue again when the page refused it before Send and the chat has gone quiet', async () => {
+    const config = defaultConfig();
+    await saveConfig({ ...config, sessions: { ...config.sessions, record: true }, ui: { ...config.ui, rotateStopFallback: true } });
+    setRotationHoldForTests(5_000);
+    setOwedQuietForTests(250);
+    const clock = { now: Date.now() };
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => clock.now);
+    try {
+      const chat = 'f0f00003-1111-4111-8111-000000000411', turn = 'g-owed-0-1';
+      const sessionId = await turnFor(chat, turn, 31);
+      await declineTwice(chat, sessionId, clock);
+      await (await heldCall(chat))();
+      await vi.waitFor(async () => {
+        expect((await request('GET', '/status')).body.stopTurns).toEqual([expect.objectContaining({ conversationId: chat, turnId: turn })]);
+      }, { timeout: 10_000, interval: 50 });
+      await events(chat, [{ kind: 'turn_end', time: clock.now, turnId: turn, outcome: 'stopped' }]);
+      const afterStop = async () => (await listInputs()).filter(entry => entry.sessionId === sessionId && entry.purpose === 'rotation' && entry.afterStop === true);
+      await vi.waitFor(async () => { expect(await afterStop()).toHaveLength(1); }, { timeout: 10_000, interval: 50 });
+      // The page claims it and refuses before Send, as in the report.
+      const first = (await afterStop())[0]!;
+      const page = { id: first.id, owner: 'rotation-page', conversationId: chat };
+      expect((await request('POST', '/input/claim', { body: { ...page, requiresAuthorization: true } })).body.input).toMatchObject({ id: first.id });
+      await request('POST', '/input/fail', { body: { ...page, error: 'The composer changed; your draft was preserved', detail: 'draft-preserved' } });
+      // Nothing happens in the chat: the continue is owed and is filed again, as a new message.
+      await vi.waitFor(async () => {
+        const rows = await afterStop();
+        expect(rows).toHaveLength(2);
+        expect(rows.find(entry => entry.id !== first.id)).toMatchObject({ state: 'queued', text: rotationMessage() });
+      }, { timeout: 10_000, interval: 50 });
+      expect(getLog().some(entry => entry.message.includes('filing it again (try 2 of 4)'))).toBe(true);
+    } finally { spy.mockRestore(); setOwedQuietForTests(); setRotationHoldForTests(15_000); await saveConfig({ ...config, sessions: { ...config.sessions, record: true } }); }
+  });
+
+  // CodeRabbit on #2136: the stopped request reopens the turn; the person stops that turn. The Continue the app
+  // still owed from its own rotation Stop must not be filed behind their Stop.
+  it('ends the owed continue when the person stops the turn the stopped request reopened', async () => {
+    const config = defaultConfig();
+    await saveConfig({ ...config, sessions: { ...config.sessions, record: true }, ui: { ...config.ui, rotateStopFallback: true } });
+    setRotationHoldForTests(5_000);
+    setOwedQuietForTests(400);
+    const clock = { now: Date.now() };
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => clock.now);
+    try {
+      const chat = 'f0f00003-1111-4111-8111-000000000412', turn = 'g-owed-1-1';
+      const sessionId = await turnFor(chat, turn, 31);
+      await declineTwice(chat, sessionId, clock);
+      await (await heldCall(chat))();
+      await vi.waitFor(async () => {
+        expect((await request('GET', '/status')).body.stopTurns).toEqual([expect.objectContaining({ conversationId: chat, turnId: turn })]);
+      }, { timeout: 10_000, interval: 50 });
+      await events(chat, [{ kind: 'turn_end', time: clock.now, turnId: turn, outcome: 'stopped' }]);
+      const afterStop = async () => (await listInputs()).filter(entry => entry.sessionId === sessionId && entry.purpose === 'rotation' && entry.afterStop === true);
+      await vi.waitFor(async () => { expect(await afterStop()).toHaveLength(1); }, { timeout: 10_000, interval: 50 });
+      const first = (await afterStop())[0]!;
+      const page = { id: first.id, owner: 'rotation-page', conversationId: chat };
+      expect((await request('POST', '/input/claim', { body: { ...page, requiresAuthorization: true } })).body.input).toMatchObject({ id: first.id });
+      await request('POST', '/input/fail', { body: { ...page, error: 'The composer changed; your draft was preserved', detail: 'draft-preserved' } });
+      expect(owedContinueFor(chat)).toEqual({ attempts: 1 });
+      // The stopped request reopens the turn, and the person stops it.
+      await events(chat, [{ kind: 'turn_start', time: clock.now, turnId: 'g-owed-1-2' }]);
+      expect((await findSessionByConversation(chat))?.activeTurnId).toBe('g-owed-1-2');
+      await stopSessionTurn(sessionId, 'g-owed-1-2', { from: 'the app' });
+      // The obligation and its booked check are gone, so nothing can file a Continue behind their Stop; no waiting for a timer that is not there.
+      expect(owedContinueFor(chat)).toBeNull();
+      expect(owedTimerPendingForTests(chat)).toBe(false);
+      expect(await afterStop()).toHaveLength(1);
+    } finally { spy.mockRestore(); setOwedQuietForTests(); setRotationHoldForTests(15_000); await saveConfig({ ...config, sessions: { ...config.sessions, record: true } }); }
   });
 
   // CodeRabbit on #1954: the fence is in memory, the Stop it protects is durable. After a restart with

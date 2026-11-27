@@ -198,6 +198,89 @@ it('lets a local orchestrator spawn real broker workers without a ChatGPT prime 
   expect(broker.primeConversation(result.body.runId)).toBeNull();
 });
 
+it('reads a worker delegation proposal through the authenticated owner inbox without spawning a child', async () => {
+  const modulePath = '../scripts/ecom-cos-native-delegation.mjs';
+  const { readNativeCosDelegationRequests } = await import(modulePath);
+  const spawn = (await worker('spawn', { ownerId, workers: [{ task: 'Propose an independent verification.' }] })).body;
+  expect(broker.bindConversation('worker-1', 'delegation-fixture-worker', spawn.runId)).toBe(true);
+  broker.sendMessage({ conversationId: 'delegation-fixture-worker', runId: spawn.runId }, 'prime',
+    'ECOM_DELEGATION_V1\n' + JSON.stringify({ label: 'Verifier', task: 'Check the fixture.' }));
+  const proof = await readNativeCosDelegationRequests({ localOwnerId: ownerId, familyId: spawn.runId, userDataPath: directory });
+  expect(proof.proposals).toMatchObject([{ parentWorkerId: 'worker-1', familyId: spawn.runId,
+    child: { label: 'Verifier', task: 'Check the fixture.' }, state: 'PROPOSED', requiresCanonicalApproval: true, dispatched: false }]);
+  expect(proof.canonicalMissionAck).toBe(false);
+  expect((await worker('status', { ownerId, runId: spawn.runId })).body.workers).toHaveLength(1);
+});
+
+it('dispatches an approved worker delegation through the real native broker once and retains parent receipt', async () => {
+  const readModule = '../scripts/ecom-cos-native-delegation.mjs';
+  const dispatchModule = '../scripts/ecom-cos-native-delegation-dispatch.mjs';
+  const { readNativeCosDelegationRequests } = await import(readModule);
+  const { dispatchApprovedNativeCosDelegation } = await import(dispatchModule);
+  const spawn = (await worker('spawn', { ownerId, workers: [{ task: 'Request independent verification.' }] })).body;
+  expect(broker.bindConversation('worker-1', 'delegation-dispatch-fixture', spawn.runId)).toBe(true);
+  broker.sendMessage({ conversationId: 'delegation-dispatch-fixture', runId: spawn.runId }, 'prime',
+    'ECOM_DELEGATION_V1\n' + JSON.stringify({ label: 'Verifier', task: 'Check the fixture.' }));
+  const native = { localOwnerId: ownerId, familyId: spawn.runId, userDataPath: directory };
+  const proposal = (await readNativeCosDelegationRequests(native)).proposals[0];
+  const reservations = new Set<string>();
+  const receipts: unknown[] = [];
+  // Fixture callbacks model the controller contract, not live canonical approval.
+  const options = { ...native, originalMissionId: 'umi-' + 'a'.repeat(24),
+    leaseId: 'fixture-lease', canonicalRevision: 'fixture-revision',
+    reportId: proposal.reportId, proposalDigest: proposal.proposalDigest,
+    reserveCanonical: async (scope: any) => {
+      if (reservations.has(scope.idempotencyKey)) return { state: 'DENIED' };
+      reservations.add(scope.idempotencyKey);
+      return { state: 'RESERVED', reservationId: 'fixture-reservation',
+        idempotencyKey: scope.idempotencyKey, proposalDigest: scope.proposalDigest };
+    },
+    assertCanonical: async () => true,
+    recordCanonicalDispatch: async (receipt: unknown) => { receipts.push(receipt); return true; } };
+  const receipt = await dispatchApprovedNativeCosDelegation(options);
+  expect(receipt).toMatchObject({ parentWorkerId: 'worker-1', childWorkerId: 'worker-2',
+    familyId: spawn.runId, state: 'DISPATCHED', canonicalMissionAck: false });
+  expect(receipts).toHaveLength(1);
+  await expect(dispatchApprovedNativeCosDelegation(options)).rejects.toThrow('RESERVATION_REQUIRED_OR_ALREADY_USED');
+  expect((await worker('status', { ownerId, runId: spawn.runId })).body.workers).toHaveLength(2);
+});
+
+it('dispatches through the controller adapter against the real authenticated native HTTP broker', async () => {
+  // The canonical decision here is a test fixture only, not a production mission lease.
+  const modulePath = '../scripts/ecom-cos-native-dispatch.mjs';
+  const { dispatchNativeCosWorker } = await import(modulePath);
+  const scopes: Array<{ localOwnerId: string; familyId: string | null; action: string; body: string }> = [];
+  const calls: string[] = [];
+  const options = {
+    localOwnerId: ownerId, familyId: null, userDataPath: directory,
+    action: 'spawn', payload: { workers: [{ task: 'Isolated broker acceptance fixture.' }] },
+    assertCanonical: async (scope: typeof scopes[number]) => { scopes.push(scope); return true; },
+    request: async (url: string, opts: RequestInit) => { calls.push(opts.method!); return fetch(url, opts); }
+  };
+  await expect(dispatchNativeCosWorker({ ...options, assertCanonical: async () => false }))
+    .rejects.toThrow('ECOM_CANONICAL_DISPATCH_DENIED');
+  expect(calls).toEqual([]);
+  const first = await dispatchNativeCosWorker(options);
+  expect(first).toMatchObject({ state: 'DISPATCHED', localOwnerId: ownerId,
+    workerIds: ['worker-1'], canonicalMissionAck: false });
+  expect(calls).toEqual(['GET', 'POST', 'GET']);
+  expect(scopes).toHaveLength(3);
+  expect(scopes.every(scope => scope === scopes[0] && Object.isFrozen(scope))).toBe(true);
+  expect(broker.primeConversation(first.runId)).toBeNull();
+  expect(broker.bindConversation('worker-1', 'controller-fixture-worker', first.runId)).toBe(true);
+  broker.finishAgent({ conversationId: 'controller-fixture-worker' }, 'Fixture report only.');
+  broker.releaseQuiescentRun({ allowPendingReports: true }, first.runId);
+  const reports = await worker('reports', { ownerId, runId: first.runId });
+  expect(reports.body.messages).toMatchObject([{ from: 'worker-1', text: expect.stringContaining('Fixture report only.') }]);
+  const wake = await dispatchNativeCosWorker({ ...options, familyId: first.familyId, action: 'message',
+    payload: { messages: [{ to: 'worker-1', text: 'Isolated follow-up fixture.' }] } });
+  expect(wake.familyId).toBe(first.familyId);
+  expect(wake.runId).not.toBe(first.runId);
+  expect(wake.workerIds).toEqual(['worker-1']);
+  expect(wake.canonicalMissionAck).toBe(false);
+  expect(calls).toEqual(['GET', 'POST', 'GET', 'GET', 'POST', 'GET']);
+});
+
 it('collects exact worker reports across parking, explicitly acknowledges them, and reuses the sleeper', async () => {
   const spawn = (await worker('spawn', { ownerId, workers: [{ task: 'First assignment.' }] })).body;
   broker.bindConversation('worker-1', 'local-worker-chat', spawn.runId);
@@ -232,8 +315,39 @@ it('retains local ownership and unread reports through a broker restart', async 
   broker.restoreSwarm(snapshot);
   broker.onSwarmPersistNow(state => durable.writeDurableNow('swarm', state));
   const status = await worker('status', { ownerId, runId: spawn.runId });
+  expect(status.body.runId).toBeNull();
+  expect(status.body.nativeBroker).toMatchObject({ localOwnerId: ownerId, runId: spawn.runId, missionAck: false });
   expect(status.body.workers).toMatchObject([{ id: 'worker-1', state: 'sleeping', revivable: true }]);
   expect((await worker('reports', { ownerId, runId: spawn.runId })).body.messages).toMatchObject([{ from: 'worker-1', text: expect.stringContaining('retained report') }]);
+});
+
+it('rediscovers the same local family without a prime chat after parking, restart and wake', async () => {
+  const first = (await worker('spawn', { ownerId, workers: [{ task: 'Inspect.' }] })).body;
+  const foreignOwner = '33333333-3333-4333-8333-333333333333';
+  const foreign = (await worker('spawn', { ownerId: foreignOwner, workers: [{ task: 'Other owner.' }] })).body;
+  broker.bindConversation('worker-1', 'stable-family-worker', first.runId);
+  broker.finishAgent({ conversationId: 'stable-family-worker' }, 'RESULT: retained');
+  broker.releaseQuiescentRun({ allowPendingReports: true }, first.runId);
+  const snapshot = broker.snapshotSwarm();
+  broker.resetAgentsForTests();
+  broker.restoreSwarm(snapshot);
+  broker.onSwarmPersistNow(state => durable.writeDurableNow('swarm', state));
+  const parked = (await worker('status', { ownerId })).body;
+  expect(parked.familyDirectory).toEqual({
+    selectedFamilyId: first.runId, selectionRequired: false,
+    families: [{ familyId: first.runId, runId: first.runId, running: false }]
+  });
+  expect(parked.nativeBroker.runId).toBe(first.runId);
+  const wake = await worker('message', { ownerId, runId: first.runId, messages: [{ to: 'worker-1', text: 'Resume.' }] });
+  expect(wake.status).toBe(202);
+  expect(wake.body.runId).not.toBe(first.runId);
+  const resumed = (await worker('status', { ownerId, runId: first.runId })).body;
+  expect(resumed.familyDirectory).toEqual({
+    selectedFamilyId: first.runId, selectionRequired: false,
+    families: [{ familyId: first.runId, runId: wake.body.runId, running: true }]
+  });
+  expect(resumed.nativeBroker.runId).toBe(wake.body.runId);
+  expect((await worker('status', { ownerId, runId: foreign.runId })).status).toBe(500);
 });
 
 it('does not reoffer successfully acknowledged reports after loading the durable broker snapshot', async () => {

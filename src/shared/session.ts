@@ -92,24 +92,37 @@ export interface AssetRef {
   height?: number;
 }
 
+export interface SessionImageStorageInfo {
+  sessionId: string;
+  usedBytes: number;
+  limitBytes: number;
+  imageBytes: number;
+  textBytes: number;
+}
+
 /** Recording-asset storage is global; cleanup never changes the configured ceiling. */
 export interface ImageStorageInfo {
   /** All bytes charged to the global session-asset quota, including preserved non-image assets. */
   usedBytes: number;
   limitBytes: number;
+  /** Usage within the requested chat when inspected from a chat (#2198). */
+  session?: SessionImageStorageInfo;
 }
 
-export interface ImageStorageClearResult extends ImageStorageInfo {
+export interface ImageStorageClearResult extends Omit<ImageStorageInfo, 'usedBytes'> {
+  /** Global bytes used after cleanup, or `null` when a post-cleanup global recount fails. */
+  usedBytes: number | null;
   /** Physical bytes removed by this explicit user operation. */
   freedBytes: number;
   removedFiles: number;
 }
 
 /**
- * `oldest-gib` and `all` remove images only. `old-chats-gib` empties whole chats unused for a
- * week, oldest first, of images and long texts until about 1 GiB is free (#1406).
+ * `oldest-gib` and `all` remove images only across all chats. `old-chats-gib` empties whole chats
+ * unused for a week, oldest first, of images and long texts until about 1 GiB is free (#1406).
+ * `session-images` and `session-texts` target only one chat (#2198).
  */
-export type ImageStorageClearMode = 'oldest-gib' | 'all' | 'old-chats-gib';
+export type ImageStorageClearMode = 'oldest-gib' | 'all' | 'old-chats-gib' | 'session-images' | 'session-texts';
 
 /** The recording storage sizes Settings offers, in GiB. The first is the default. */
 export const RECORDING_STORAGE_LIMITS_GIB = [2, 5, 10, 20, 50] as const;
@@ -154,6 +167,21 @@ export interface FileChange {
   reviewAssetId?: string;
   /** Why no review was kept for this change, so the UI can say so instead of offering nothing. */
   reviewUnavailable?: 'too-large' | 'not-kept';
+}
+
+/** The latest recorded edit of a path within the selected chat's local project. */
+export interface ChatEdit {
+  path: string;
+  callId: string;
+  index: number;
+  position: number;
+  state: 'changed' | 'deleted' | 'missing' | 'unavailable';
+  reviewable: boolean;
+}
+
+export interface ChatEdits {
+  rows: ChatEdit[];
+  limited: boolean;
 }
 
 /** Historical edit evidence, independent of the current Git working tree. */
@@ -231,10 +259,12 @@ export interface ToolCallRecord {
   attribution: CallAttribution;
   /** Normalized inbound HTTP x-request-id, retained for forensic correlation. */
   requestId: string | null;
-  /** Conversation proven by that request id, or null when ownership was unresolved. */
+  /** Recorded conversation; generation placement is provisional and never caller proof. */
   conversationId: string | null;
-  /** Deterministic placement outcome for current, unresolved, or deliberately retired callers. */
-  attributionMethod: 'request_id' | 'unattributed' | 'superseded';
+  /** Exact, provisional, unresolved or deliberately retired recording placement. */
+  attributionMethod: 'request_id' | 'unattributed' | 'superseded' | 'generation';
+  /** Native request that anchored a verified host conversation-metadata correlation. */
+  providerSessionAnchor?: string;
   /** Exact arguments as JSON. Cut inline past the cap, with the whole text in an asset. */
   args: StoredText;
   result: StoredText;
@@ -381,6 +411,8 @@ export type SessionEvent =
       inputId?: string;
       /** #1826: the message was a run of the chat's schedule, due then, and sent late when `late`. */
       scheduled?: { dueAt: number; late: boolean };
+      /** Sent by the person from elsewhere: a reply to a Telegram notification (Haz on #1990). */
+      via?: 'telegram';
       /** Tool handout remains unconfirmed until a later exact invocation proves receipt. */
       inputDelivery?: 'offered' | 'confirmed';
       /** Original app-authored text, excluding transport-only control instructions. */
@@ -393,16 +425,22 @@ export type SessionEvent =
       parentId?: string;
       /** Edit & resubmit (#365): the question this one is a later version of, in ChatGPT's own edit. */
       replaces?: string;
+      /** The app acknowledged this exact edit; read-time inference cannot revoke its replacement link. */
+      replacesConfirmed?: true;
       /** A Goal or Loop follow-up its page typed: the app's message, not the person's (#1655). */
       automatic?: true;
       attachments?: import('./input.js').InputAttachment[];
       assets?: AssetRef[];
       /** Image assets explicitly removed from local recording storage; same-message replay cannot restore them. */
       retiredImageAssetIds?: string[];
+      /** Overflow text assets explicitly removed from local recording storage; same-message replay cannot restore them. */
+      retiredTextAssetIds?: string[];
       /** First sequence assigned to this stable website message; revisions keep this anchor. */
       origin?: number;
       /** Store-owned authored-content revision; metadata and rehydration preserve it. */
       contentSeq?: number;
+      /** ChatGPT conversation id that observed this message, scoping multi-chat/rotated echo matching. */
+      conversationId?: string;
     })
   | (BaseEvent & {
       kind: 'assistant_message';
@@ -432,16 +470,22 @@ export type SessionEvent =
       state?: MessageState;
       /** Compatibility mirror for older consumers; equivalent to state === 'final'. */
       final: boolean;
+      /** ChatGPT withdrew this unfinalized streaming message from the turn before completing it. */
+      retracted?: true;
       /** This exact stable reply was proven terminal and may enter Goal policy. */
       goalEligible?: boolean;
       /** Store-owned sequence of the latest final text/state change; rendering/metadata cannot advance it. */
       finalContentSeq?: number;
       /** Local acceptance time of final content; provider time can predate its last tools. */
       finalObservedAt?: number;
+      /** Store-observed streaming-to-final boundary; first-seen finals have no proven settlement order. */
+      settledAtSeq?: number;
       /** First sequence assigned to this logical message; later revisions keep this anchor. */
       origin?: number;
       /** Store-owned text/state revision, including interim progress before the final. */
       contentSeq?: number;
+      /** Overflow text assets explicitly removed from local recording storage; same-message replay cannot restore them. */
+      retiredTextAssetIds?: string[];
     })
   | (BaseEvent & {
       /** ChatGPT-native generated media, independent of assistant prose and local MCP calls. */
@@ -461,7 +505,7 @@ export type SessionEvent =
       previewWidth?: number;
       previewHeight?: number;
       previewStatus: 'pending' | 'available' | 'unavailable';
-      previewError?: 'not_loaded' | 'ambiguous' | 'tainted' | 'oversized' | 'invalid' | 'quota' | 'removed';
+      previewError?: 'not_loaded' | 'ambiguous' | 'tainted' | 'oversized' | 'invalid' | 'quota' | 'session_quota' | 'removed';
       asset?: AssetRef;
       /** First sequence assigned to this exact provider-message/asset tuple. */
       origin?: number;
@@ -482,7 +526,9 @@ export type SessionEvent =
    * event written before this model existed, or by a page whose commentary had no readable
    * identity, is still a plain standalone caption.
    */
-  | (BaseEvent & { kind: 'progress'; message: StoredText; progressId?: string; origin?: number; reason?: 'helper_stop_unverified'; finishControl?: { state: 'released' | 'notified' | 'decision'; conversationId: string; revision?: string; inputRevision?: string; workSeq?: number } })
+  | (BaseEvent & { kind: 'progress'; message: StoredText; progressId?: string; origin?: number;
+      /** Set by foldProgress: when its newest update came; `time` stays when it began. */
+      updatedAt?: number; reason?: 'helper_stop_unverified'; finishControl?: { state: 'released' | 'notified' | 'decision'; conversationId: string; revision?: string; inputRevision?: string; workSeq?: number } })
   /**
    * Visible ChatGPT-native tool activity that never passed through this MCP server.
    *
@@ -672,6 +718,13 @@ export interface SessionSummary {
   selectedModel?: { conversationId: string; model: string; observedAt: number; reasoningEffort?: ReasoningEffort };
   /** Explicit local project; durable across frontend conversation replacement. */
   projectId?: string;
+  /**
+   * The person moved this chat to its project, or out of one (#1919). The app then never binds it
+   * to a project by itself again, as it does for a chat started in a linked ChatGPT Project.
+   */
+  projectChosen?: true;
+  /** Moved into its project since the person's last message: the next one names the folder once. */
+  projectNotePending?: true;
   id: string;
   title: string;
   /**
@@ -702,6 +755,10 @@ export interface SessionSummary {
   events: number;
   userMessages: number;
   toolCalls: number;
+  /** Calls provisionally placed by the only observed running turn; never caller proof. */
+  provisionalToolCalls?: number;
+  /** Provider-proven calls whose provenance can be upgraded by native request evidence. */
+  providerSessionToolCalls?: number;
   /** Start time of the newest exact attributed tool call, independent of later page noise. */
   lastToolCallAt: number | null;
   /**
@@ -1200,6 +1257,8 @@ export function eventTokens(event: SessionEvent): number {
         Number.isFinite(event.wireTokenEstimate) ? Math.max(0, Math.floor(event.wireTokenEstimate!)) : 0
       );
     case 'assistant_message':
+      if (event.retracted === true) return 0;
+      return storedTextTokens(event.message);
     case 'chat_error':
     case 'note':
       return storedTextTokens(event.message);
@@ -1268,7 +1327,7 @@ export function foldProgress(events: readonly SessionEvent[]): SessionEvent[] {
     }
     const held = out[at];
     if (held && held.kind === 'progress' && event.kind === 'progress') {
-      out[at] = { ...held, message: event.message };
+      out[at] = { ...held, message: event.message, updatedAt: event.time };
     } else if (held && held.kind === 'page_tool' && event.kind === 'page_tool') {
       out[at] = { ...held, label: event.label };
     } else if (held && held.kind === 'tool_call' && event.kind === 'tool_call') {
@@ -1356,3 +1415,6 @@ export const UNATTRIBUTED_SESSION_TITLE = 'Unattributed activity';
 export function isUnattributedSession(summary: { conversationId: string | null; title: string; origin?: SessionOrigin | null }): boolean {
   return summary.conversationId === null && !summary.origin && summary.title === UNATTRIBUTED_SESSION_TITLE;
 }
+
+/** How long a Compact & Resume may wait for ChatGPT's summary before the last saved one is offered (2026-11-01). */
+export const STUCK_SUMMARY_MS = 15 * 60_000;

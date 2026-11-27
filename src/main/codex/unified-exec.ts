@@ -244,7 +244,17 @@ export interface SpawnParams {
 
 const EARLY_EXIT_GRACE_PERIOD_MS = 150;
 const POST_EXIT_CLOSE_WAIT_CAP_MS = 50;
+/**
+ * A person's view of a command (#1920) shows its exit line only after its output went quiet this
+ * long: a PTY closes its output with its exit, yet its last data can arrive just after it
+ * (CodeRabbit on #2052). Bounded, and only the view waits; the agent's own reads are unchanged.
+ */
+const WATCH_EXIT_QUIET_MS = 150;
+const WATCH_EXIT_QUIET_CAP_MS = 1_000;
 export const MAX_COMPLETED_EXEC_RESULTS = 64;
+// Completed but unacknowledged results no longer consume live terminal slots.
+// Bound the combined backlog as well; never evict owed output to make room.
+export const MAX_OUTSTANDING_EXEC_RESULTS = 128;
 export const COMPLETED_EXEC_OUTPUT_BYTES = 256 * 1024;
 
 /** Applies `UNIFIED_EXEC_ENV` over the caller's environment, as `apply_unified_exec_env`. */
@@ -437,8 +447,15 @@ class UnifiedExecProcess {
     }
   }
 
+  /** Read-only viewers of this output (#1920); they see each chunk and take nothing from the agent's reads. */
+  private readonly watchers = new Set<(chunk: Buffer) => void>();
+  watch(listener: (chunk: Buffer) => void): () => void { this.watchers.add(listener); return () => { this.watchers.delete(listener); }; }
+  /** The output so far, as retained for completed results (head and tail, with a marker where bytes were left out). */
+  historyBytes(): Buffer { return this.history.toBytesWithOmissionMarker(); }
+
   private pushChunk(chunk: Buffer): void {
     if (chunk.length === 0) return;
+    for (const watcher of this.watchers) { try { watcher(chunk); } catch { /* a viewer never breaks the command */ } }
     this.history.pushChunk(chunk);
     this.buffer.pushChunk(chunk);
     if (this.batchDisplay) this.displayBuffer!.pushChunk(this.batchDisplay.push(chunk));
@@ -770,7 +787,7 @@ export class UnifiedExecProcessManager {
   allocateProcessId(draw: () => number = () => randomInt(1_000, 100_000)): number {
     for (;;) {
       const processId = draw();
-      if (this.reservedProcessIds.has(processId) || this.completed.has(processId)) continue;
+      if (this.reservedProcessIds.has(processId) || this.processes.has(processId) || this.completed.has(processId)) continue;
       this.reservedProcessIds.add(processId);
       return processId;
     }
@@ -782,6 +799,18 @@ export class UnifiedExecProcessManager {
     this.completed.delete(processId);
     this.releaseListener?.(processId);
     this.notifyProcessChange();
+  }
+
+  /** Release only the live-slot reservation, retaining exact ownership, output and exit
+   * status until the existing receipt/poll path acknowledges it. No active child is killed. */
+  private retireLiveSlot(entry: ProcessEntry): boolean {
+    if (this.processes.get(entry.processId) !== entry || entry.initialExecCommandActive ||
+        !entry.process.hasExited() || !entry.process.outputClosed) return false;
+    return this.reservedProcessIds.delete(entry.processId);
+  }
+
+  private sweepExitedSlots(): void {
+    for (const entry of this.processes.values()) this.retireLiveSlot(entry);
   }
 
   private retainCompleted(entry: ProcessEntry): void {
@@ -845,10 +874,19 @@ export class UnifiedExecProcessManager {
         initialExecCommandActive: true,
         classifyExit: request.classifyExit, batchMarker: request.batchMarker
       });
-      void process.completion.then(
-        () => this.notifyProcessChange(),
-        () => this.notifyProcessChange()
-      );
+      void process.completion.then(async () => {
+        const entry = this.processes.get(request.processId);
+        if (!entry || entry.process !== process) return;
+        // A pipe can exit before its last bytes arrive. Wait for actual stream closure,
+        // not an arbitrary idle TTL. Admission also sweeps completed entries synchronously.
+        this.notifyProcessChange();
+        if (!process.outputClosed) {
+          const closed = process.outputClosedNotify.notified();
+          try { await closed.promise; }
+          finally { closed.dispose(); }
+        }
+        if (this.retireLiveSlot(entry)) this.notifyProcessChange();
+      }).catch(() => this.notifyProcessChange());
     }
 
     const deadline = start + clampYieldTime(request.yieldTimeMs);
@@ -912,7 +950,10 @@ export class UnifiedExecProcessManager {
     };
     if (responseProcessId !== null) {
       const entry = this.processes.get(request.processId);
-      if (entry?.process === process) entry.initialExecCommandActive = false;
+      if (entry?.process === process) {
+        entry.initialExecCommandActive = false;
+        if (this.retireLiveSlot(entry)) this.notifyProcessChange();
+      }
     }
     return response;
   }
@@ -1043,6 +1084,38 @@ export class UnifiedExecProcessManager {
   }
 
   /** Live sessions, oldest id first. */
+  /**
+   * A live, read-only view of a running command's output for the person (#1920): the output so far,
+   * then each new chunk, then its exit. Nothing is consumed, so the agent's own polls read exactly
+   * what they would have. Null when that exact process (id and incarnation) is not running.
+   */
+  watchOutput(processId: number, incarnation: number, onChunk: (chunk: Buffer) => void,
+    onExit: (completion: ProcessCompletion) => void): { history: Buffer; startedAt: number; unsubscribe: () => void } | null {
+    const entry = this.processes.get(processId);
+    if (!entry || entry.incarnation !== incarnation) return null;
+    let watching = true;
+    let lastChunkAt = 0;
+    const process = entry.process;
+    const stop = process.watch(chunk => { lastChunkAt = Date.now(); onChunk(chunk); });
+    void process.completion.then(async completion => {
+      // A pipe's streams can still be draining when it exits: the same bounded wait as a completed read.
+      if (!process.outputClosed) {
+        const closed = process.outputClosedNotify.notified();
+        try { await raceWithTimeout([closed], POST_EXIT_CLOSE_WAIT_CAP_MS); } finally { closed.dispose(); }
+      }
+      if (process.tty) {
+        const exitedAt = Date.now();
+        while (watching && Date.now() - exitedAt < WATCH_EXIT_QUIET_CAP_MS) {
+          const quietFor = Date.now() - Math.max(lastChunkAt, exitedAt);
+          if (quietFor >= WATCH_EXIT_QUIET_MS) break;
+          await new Promise(resolve => setTimeout(resolve, WATCH_EXIT_QUIET_MS - quietFor));
+        }
+      }
+      if (watching) onExit(completion);
+    });
+    return { history: entry.process.historyBytes(), startedAt: entry.startedAt, unsubscribe: () => { watching = false; stop(); } };
+  }
+
   listProcesses(): BackgroundTerminalInfo[] {
     return [...this.processes.values()]
       .filter((entry) => !entry.process.hasExited())
@@ -1161,7 +1234,7 @@ export class UnifiedExecProcessManager {
 
   async terminateAllProcesses(): Promise<void> {
     const entries = [...this.processes.values()];
-    for (const id of new Set([...this.reservedProcessIds, ...this.completed.keys()])) this.releaseListener?.(id);
+    for (const id of new Set([...this.reservedProcessIds, ...this.processes.keys(), ...this.completed.keys()])) this.releaseListener?.(id);
     this.completed.clear();
     this.processes.clear();
     this.reservedProcessIds.clear();
@@ -1185,13 +1258,20 @@ export class UnifiedExecProcessManager {
     return { kind: 'alive', exitCode, processId: entry.processId };
   }
 
-  /** Capacity is admission, never garbage collection: every retained row still owes output. */
+  /** Admission separates live capacity from unread results; neither may grow without bound. */
   private ensureProcessCapacity(requestProcessId: number): void {
+    this.sweepExitedSlots();
+    const archivedUnread = [...this.processes.keys()].filter(id => !this.reservedProcessIds.has(id)).length;
+    if (this.reservedProcessIds.size + archivedUnread > MAX_OUTSTANDING_EXEC_RESULTS) {
+      throw UnifiedExecError.createProcess(
+        `too many outstanding terminal results (limit ${MAX_OUTSTANDING_EXEC_RESULTS}); read retained results before starting another`
+      );
+    }
     // Reservations participate in the hard cap, so concurrent exec_command calls cannot
     // each observe one free slot and collectively insert a 65th live process.
     if (this.reservedProcessIds.size > MAX_UNIFIED_EXEC_PROCESSES) {
       throw UnifiedExecError.createProcess(
-        `too many retained terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES}); drain a returned session with write_stdin before starting another`
+        `too many live or draining terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES}); wait for completion or drain a returned session before starting another`
       );
     }
     if (!this.reservedProcessIds.has(requestProcessId)) {

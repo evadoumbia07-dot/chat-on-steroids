@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { UnifiedExecProcessManager, applyUnifiedExecEnv } from '../src/main/codex/unified-exec.js';
+import { UnifiedExecProcessManager, applyUnifiedExecEnv, MAX_OUTSTANDING_EXEC_RESULTS } from '../src/main/codex/unified-exec.js';
 import {
   DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
   MAX_UNIFIED_EXEC_PROCESSES
@@ -56,7 +56,7 @@ it('does not let a lock attempt barge ahead of an already queued waiter', async 
   }
 });
 
-it('refuses new capacity without evicting a completed unread result', async () => {
+it('frees a live slot automatically while preserving the completed unread result and hard live cap', async () => {
   const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
   const unreadId = manager.allocateProcessId();
   const request = (processId: number, command: string, yieldTimeMs: number) => ({
@@ -73,6 +73,8 @@ it('refuses new capacity without evicting a completed unread result', async () =
     tty: false
   });
   const fillerIds: number[] = [];
+  const released = new Set<number>();
+  manager.setProcessReleaseListener(id => released.add(id));
 
   try {
     const started = await manager.execCommand(
@@ -85,14 +87,25 @@ it('refuses new capacity without evicting a completed unread result', async () =
     ]);
 
     while (fillerIds.length < MAX_UNIFIED_EXEC_PROCESSES - 1) fillerIds.push(manager.allocateProcessId());
+    const admittedId = manager.allocateProcessId();
+    const admitted = await manager.execCommand(request(admittedId, "setInterval(() => {}, 1000)", 100));
+    expect(admitted.processId).toBe(admittedId);
     const refusedId = manager.allocateProcessId();
     await expect(manager.execCommand(request(refusedId, "console.log('must-not-run')", 100))).rejects.toThrow(
-      `too many retained terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES})`
+      `too many live or draining terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES})`
     );
+    // The detached unread ID is still reserved for the exact original owner.
+    const used = new Set([unreadId, admittedId, refusedId, ...fillerIds]);
+    let freshId = 1000;
+    while (used.has(freshId)) freshId++;
+    const draws = [unreadId, freshId];
+    expect(manager.allocateProcessId(() => draws.shift()!)).toBe(freshId);
+    manager.releaseProcessId(freshId);
 
     expect(manager.backgroundState(new Set([unreadId])).exitedUnread).toEqual([
       { processId: unreadId, exitCode: 7 }
     ]);
+    expect(released.has(unreadId)).toBe(false);
     const drained = await manager.writeStdin({
       processId: unreadId,
       input: '',
@@ -106,4 +119,18 @@ it('refuses new capacity without evicting a completed unread result', async () =
     for (const processId of fillerIds) manager.releaseProcessId(processId);
     await manager.terminateAllProcesses();
   }
+});
+
+it('bounds all outstanding reservations even if completed output must still be preserved', async () => {
+  const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
+  try {
+    for (let i=0; i<MAX_OUTSTANDING_EXEC_RESULTS; i++) manager.allocateProcessId();
+    const id=manager.allocateProcessId();
+    await expect(manager.execCommand({
+      command:[process.execPath,'-e','throw Error("must not run")'],
+      shellType:process.platform==='win32'?'powershell':'bash',hookCommand:'backlog limit probe',
+      processId:id,yieldTimeMs:250,maxOutputTokens:undefined,truncationPolicy,cwd:process.cwd(),
+      displayCwd:process.cwd(),env:applyUnifiedExecEnv(process.env),tty:false
+    })).rejects.toThrow(`too many outstanding terminal results (limit ${MAX_OUTSTANDING_EXEC_RESULTS})`);
+  } finally { await manager.terminateAllProcesses(); }
 });

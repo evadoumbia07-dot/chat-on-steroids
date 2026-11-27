@@ -12,14 +12,17 @@
  * extension does nothing" into a diagnosable mismatch.
  */
 
-export const APP_VERSION = '2.1.49';
+export const APP_VERSION = '2.1.55';
+
+/** Only our reviewed fork may supply executable app or Chrome extension updates. */
+export const CUSTOM_RELEASE_REPO = 'evadoumbia07-dot/chat-on-steroids';
 
 /**
  * Standalone extension recovery must stay on the app's own release. Using GitHub's moving
  * `latest` asset can pair an older installed app with a newer, incompatible bridge protocol.
  */
 export function extensionDownloadUrl(version = APP_VERSION): string {
-  return `https://github.com/totec448-spec/chat-on-steroids/releases/download/v${encodeURIComponent(version)}/Chat-On-Steroids-Extension.zip`;
+  return `https://github.com/${CUSTOM_RELEASE_REPO}/releases/download/v${encodeURIComponent(version)}/Chat-On-Steroids-Extension.zip`;
 }
 
 /**
@@ -68,4 +71,6 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
 // draft ownership. A 12 companion would silently send text without these files.
 // 14 — exact native generated-image metadata and bounded preview observations. A 13 app
 // would ACK the journal while silently discarding that new event kind.
-export const BRIDGE_PROTOCOL = 14;
+// 15 — project-create status can be unavailable (null). A 14 companion treats that as
+// an empty/completed list and may retire a still-active helper, so reject that old peer.
+export const BRIDGE_PROTOCOL = 15;

@@ -17,6 +17,8 @@ import { randomUUID } from 'node:crypto';
 import type { AgentInfo, AgentMessage, AgentState, ReasoningEffort, SwarmState } from '../shared/session.js';
 import { REASONING_EFFORTS, isReasoningEffort } from '../shared/session.js';
 import { getConfig } from './config.js';
+import { hostCpuAdmissionSlots, hostMemoryAdmissionSlots } from './native-worker-capacity.js';
+import { setWorkerSlotSource, workerSlotsRefusal } from './chats-at-once.js';
 import { liveConnectorName } from './mcp/surfaces.js';
 import { workerBrief, workerOwnTask } from '../shared/worker-brief.js';
 import { getChatModels, refreshForUnoffered } from './chat-models.js';
@@ -147,7 +149,8 @@ export class NoChatError extends AgentsBusyError {
         '(a client such as Codex sends every tool call as a new request). A sub-agent run belongs to the chat, or the ' +
         'single request, that started it, so this call cannot reach a run started by another call. Do not call agents ' +
         'action=spawn again: a new run would be just as unreachable. Sub-agents work from a ChatGPT chat in the browser; ' +
-        'if this is one, the app may identify it in a moment.'
+        'if this is one, the app may identify it in a moment. If the chat is open in another computer\'s browser, call ' +
+        'that computer\'s Core instead: only the computer whose browser holds the chat can identify it.'
     );
   }
 }
@@ -220,6 +223,22 @@ export class IdentityLostError extends AgentError {
 export function isOver(state: AgentState): boolean {
   return state === 'finished' || state === 'failed';
 }
+
+/** A woken worker still asleep this long after its slot was reserved was not woken after all. */
+const WAKE_SLOT_GRACE_MS = 10_000;
+const workerSlotKey = (runId: string, id: string): string => `${runId}/${id}`;
+// What became of a worker a "Chats working at once" slot was reserved for (#1694, Haz on #2051).
+setWorkerSlotSource((key, reservedAt, now) => {
+  const slash = key.lastIndexOf('/');
+  const run = runs.get(key.slice(0, slash));
+  // The run is gone: its spawn was refused or it ended.
+  if (!run) return { kind: 'over' };
+  const agent = run.agents.get(key.slice(slash + 1));
+  if (!agent) return { kind: 'pending' };
+  const state = agent.info.state;
+  if (isOver(state) || state === 'detached' || (state === 'sleeping' && now - reservedAt > WAKE_SLOT_GRACE_MS)) return { kind: 'over' };
+  return agent.info.conversationId ? { kind: 'chat', conversationId: agent.info.conversationId } : { kind: 'pending' };
+});
 
 /**
  * Whether this state consumes one of the run's worker slots.
@@ -1021,6 +1040,28 @@ export function agentFamiliesForCaller(input: Caller): Array<{ run_id: string; r
   return familiesForCaller(input).map(owner => ({ run_id: familyKey(owner), running: 'runId' in owner }));
 }
 
+/** Stable owner-scoped addresses for the existing authenticated local control API.
+ * The first incarnation stays addressable across wakes and persisted broker restores.
+ * No conversation ID, request ID, new ownership claim or separate registry is needed.
+ */
+export function localOwnerFamilyDirectory(input: Caller) {
+  const caller = exactCaller(input);
+  requireEnabled();
+  if (!caller.localOwnerId || !hasCallerIdentity(caller)) throw new IdentityLostError();
+  requireMatchingSetupProfile(caller);
+  const selected = selectedFamily(caller);
+  if (caller.runId && !selected) throw busyFor(caller);
+  return {
+    selectedFamilyId: selected ? familyReplyAddress(selected) : null,
+    selectionRequired: !caller.runId && familiesForCaller(caller).length > 1,
+    families: familiesForCaller(caller).map(owner => ({
+      familyId: familyReplyAddress(owner),
+      runId: familyKey(owner),
+      running: 'runId' in owner
+    }))
+  };
+}
+
 function requireEnabled(): void {
   if (!getConfig().multiAgent.enabled) {
     throw new AgentError('Multi-agent mode is switched off in Chat On Steroids. Ask the user to enable it.');
@@ -1315,7 +1356,7 @@ export interface CallerSwarmStatus {
   runId: string | null;
   /** Capacity available inside this caller's own worker family, before any optional global cap. */
   freeWorkerSlots: number;
-  /** Free admissions after both family and global broker limits (not host/provider capacity). */
+  /** Free admissions after family/global broker limits and optional host RAM/CPU guards (not provider quota). */
   admissibleWorkerSlots: number;
 }
 
@@ -1563,11 +1604,27 @@ function globalOccupiedWorkerSlots(): number {
   return occupied;
 }
 
-/** Remaining broker-wide worker admissions, or Infinity while the opt-in cap is disabled. */
+/** Pending invitations/revivals reserve estimated memory before their browser work starts.
+ * Count unpublished stages too, so independent owners cannot reserve the same headroom.
+ */
+function hostFreeWorkerSlots(): number {
+  const { hostMemoryGuard, hostCpuGuard } = getConfig().multiAgent;
+  if (!hostMemoryGuard && !hostCpuGuard) return Infinity;
+  let pending = 0;
+  for (const run of runs.values()) {
+    for (const agent of run.agents.values()) {
+      if (agent.info.role === 'worker' && (agent.info.state === 'invited' || agent.info.state === 'waking')) pending++;
+    }
+  }
+  return Math.min(hostMemoryAdmissionSlots(hostMemoryGuard === true, pending),
+    hostCpuAdmissionSlots(hostCpuGuard === true, pending));
+}
+
+/** Remaining admissions after the existing global cap and optional host RAM/CPU guards. */
 function globalFreeWorkerSlots(): number {
   const limit = getConfig().multiAgent.globalMaxWorkers ?? 0;
-  if (limit <= 0) return Number.POSITIVE_INFINITY;
-  return Math.max(0, limit - globalOccupiedWorkerSlots());
+  const configured = limit <= 0 ? Infinity : Math.max(0, limit - globalOccupiedWorkerSlots());
+  return Math.min(configured, hostFreeWorkerSlots());
 }
 
 /**
@@ -1935,12 +1992,12 @@ function usableDefaults(
   // resolved label canonicalizes to the family. An ambiguous label stays a dropped default.
   const resolved = defaultModel && model ? resolveChatModel(models, model) : undefined;
   if (defaultModel && model && !resolved) {
-    notes.add(`The default worker model "${model}" saved in Settings is not offered by this ChatGPT account, so workers use ChatGPT's current model. Choose an available model in Settings → Agents & automation.`);
+    notes.add(`The default worker model "${model}" saved in Settings is not offered by this ChatGPT account, so workers use ChatGPT's current model. Choose an available model in Settings → Models.`);
     model = null;
   } else if (resolved && resolved.id !== model && !resolved.aliases?.includes(model!)) model = resolved.id;
   const offered = model ? (resolved ? [resolved] : models.filter(choice => choice.id === model || choice.aliases?.includes(model!))) : models;
   if (defaultEffort && effort && !offered.some(choice => choice.efforts.includes(effort!))) {
-    notes.add(`The default worker reasoning "${effort}" saved in Settings is not offered${model ? ` for model "${model}"` : ''} by this ChatGPT account, so workers use ChatGPT's current reasoning. Choose an available level in Settings → Agents & automation.`);
+    notes.add(`The default worker reasoning "${effort}" saved in Settings is not offered${model ? ` for model "${model}"` : ''} by this ChatGPT account, so workers use ChatGPT's current reasoning. Choose an available level in Settings → Models.`);
     effort = null;
   }
   if (notes.size) refreshForUnoffered(`default worker ${[...notes].join(',')}`);
@@ -2303,6 +2360,12 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
     );
   }
 
+  if (planned.length > hostFreeWorkerSlots()) {
+    if (resumedDormant) parkRun(run, 'a new spawn was rejected by the host resource admission guard');
+    else if (createdFreshRun) runs.delete(run.runId);
+    throw new AgentError((getConfig().multiAgent.hostCpuGuard ? 'HOST_RESOURCE_LIMIT: insufficient or unmeasured host RAM/CPU capacity' : 'HOST_MEMORY_LIMIT: insufficient estimated host RAM') + ' for new workers. Wait for capacity; no new worker was accepted.');
+  }
+
   const ids: string[] = [];
   // Historical rows are intentionally never reused or deleted merely because the worker is
   // asleep/terminal. The old fixed 64-id scan therefore became a lifetime cap on one prime,
@@ -2312,6 +2375,19 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
   for (let n = 1; ids.length < planned.length; n++) {
     const id = `worker-${n}`;
     if (!activeRun.agents.has(id)) ids.push(id);
+  }
+
+  // Chats working at once (#1694): workers are chats too. The prime's own slot passes to them, and
+  // each new worker's slot is named after it so it follows the worker (Haz on #2051).
+  const chatsAtOnce = workerSlotsRefusal(conversationId, ids.map(id => workerSlotKey(activeRun.runId, id)));
+  if (chatsAtOnce) {
+    if (resumedDormant) parkRun(run, 'a new spawn was refused by the chats-at-once limit');
+    else if (createdFreshRun) runs.delete(run.runId);
+    logInfo(`agents: spawn of ${planned.length} worker(s) refused: ${chatsAtOnce}`);
+    throw new AgentError(
+      `CHATS_AT_ONCE: ${chatsAtOnce} ("Chats working at once" in the app). No workers were created. ` +
+        'Continue the work yourself, or end this turn and spawn when another chat has finished; do not retry right away.'
+    );
   }
 
   const created: AgentInfo[] = [];
@@ -2769,10 +2845,22 @@ function stageMessagesActive(
           );
         }
         const globalMax = getConfig().multiAgent.globalMaxWorkers ?? 0;
-        if (globalMax > 0 && globalFreeWorkerSlots() - reserved.size <= 0) {
+        if (globalMax > 0 && globalMax - globalOccupiedWorkerSlots() - reserved.size <= 0) {
           throw new AgentError(
             `GLOBAL_WORKER_LIMIT: ${toId} is asleep and all ${globalMax} globally admitted worker slots are busy, so it ` +
               `cannot be woken right now${where}. Nothing was sent. Wait for a worker to stop and try again.`
+          );
+        }
+        if (hostFreeWorkerSlots() - reserved.size <= 0) {
+          throw new AgentError((getConfig().multiAgent.hostCpuGuard ? 'HOST_RESOURCE_LIMIT: insufficient or unmeasured host RAM/CPU capacity' : 'HOST_MEMORY_LIMIT: insufficient estimated host RAM') + ' to wake this worker. Nothing was sent.');
+        }
+        // Chats working at once (#1694): a woken worker is a working chat again.
+        const chatsAtOnce = workerSlotsRefusal(caller.conversationId ?? null, [workerSlotKey(run?.runId ?? to.info.workerAllocationRunId ?? '', to.info.id)]);
+        if (chatsAtOnce) {
+          logInfo(`agents: waking ${toId} refused: ${chatsAtOnce}`);
+          throw new AgentError(
+            `CHATS_AT_ONCE: ${toId} is asleep and ${chatsAtOnce} ("Chats working at once" in the app), so it cannot be ` +
+              `woken right now${where}. Nothing was sent. Continue yourself, or end this turn and try when another chat has finished.`
           );
         }
       }

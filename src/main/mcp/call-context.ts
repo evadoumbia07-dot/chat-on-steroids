@@ -44,6 +44,8 @@ export interface CallEvidence {
  * recorder writes down on purpose.
  */
 export interface CallCaller {
+  /** Native request anchoring a host conversation-metadata proof, when used. */
+  providerSessionAnchor?: string;
   transportKey: string | null;
   /**
    * Local Setup profile that owns the MCP endpoint generation which accepted this call.
@@ -76,6 +78,8 @@ export interface CallCaller {
 }
 
 export interface CallContext {
+  /** Presentation witness captured at admission; never consumed by caller/permission routing. */
+  recordingContext?: import('../session/recorder.js').RecordingContext | null;
   /** Result publication belongs to the transport, not to the generation-wide request ID. */
   publication?: OutputPublication;
   /** Wall-clock start of this MCP request, shared by identity-sensitive handlers. */
@@ -153,6 +157,21 @@ export function runInCallContext<T>(context: CallContext, fn: () => T): T {
 const running = new Set<CallContext>();
 const settling = new Set<CallContext>();
 let inFlightRequests = 0;
+const runningListeners = new Set<(conversationId: string) => void>();
+
+/** Subscribes to exact-owner running tool count transitions so `/activity` can refresh promptly. */
+export function onRunningToolChange(listener: (conversationId: string) => void): () => void {
+  runningListeners.add(listener);
+  return () => { runningListeners.delete(listener); };
+}
+
+function notifyRunningChange(context: CallContext): void {
+  const owner = exactOwner(context);
+  if (!owner) return;
+  for (const listener of runningListeners) {
+    try { listener(owner); } catch { /* A listener never fails tool execution. */ }
+  }
+}
 
 function countFor(calls: Iterable<CallContext>, conversationId: string | null): number {
   let count = 0;
@@ -190,6 +209,13 @@ function exactOwner(call: CallContext): string | null {
 export function runningToolProgress(conversationId: string): { count: number; since: number } | null {
   const owned = [...running].filter(call => exactOwner(call) === conversationId);
   return owned.length ? { count: owned.length, since: Math.min(...owned.map(call => call.startedAt)) } : null;
+}
+
+/** The chats with a running call, by exact ownership only (#1694 counts them as working). */
+export function runningToolConversations(): Set<string> {
+  const owners = new Set<string>();
+  for (const call of running) { const owner = exactOwner(call); if (owner) owners.add(owner); }
+  return owners;
 }
 
 /** What this chat's calls are doing right now, oldest first. The same exact ownership. */
@@ -263,10 +289,12 @@ export async function trackMcpRequest<T>(fn: () => Promise<T>): Promise<T> {
  */
 export async function trackInFlight<T>(context: CallContext, fn: () => Promise<T>): Promise<T> {
   running.add(context);
+  notifyRunningChange(context);
   try {
     return await fn();
   } finally {
     running.delete(context);
+    notifyRunningChange(context);
   }
 }
 

@@ -7,6 +7,7 @@ interface DomApi {
   insertPrompt(text: string, mode?: boolean | 'append', failure?: (reason: string) => void): boolean;
   enterProject(entry: { id: string; sourceConversationId: string }, current?: () => boolean,
     failure?: (reason: string) => void): Promise<boolean>;
+  setConnectorApps(value: { core?: Array<{ appId: string; linkId: string | null; name: string | null }> } | null): boolean;
   composer(): HTMLElement | null;
   composerText(box?: Element | null): string;
   composerActions(): { host: HTMLElement; before: HTMLElement | null } | null;
@@ -29,6 +30,7 @@ interface DomApi {
   toolBlocks(turn: ReturnType<DomApi['turns']>[number]): HTMLElement[];
   hideActivity(turn: ReturnType<DomApi['turns']>[number], covered: HTMLElement[]): void;
   sidebarListsProject(id: string): boolean | null;
+  confirmedConversationTitle(id: string): string | null;
 }
 let dom: JSDOM;
 let document: Document;
@@ -57,6 +59,50 @@ function user(text: string) {
   message.textContent = text;
   section.append(message); document.body.append(section);
 }
+
+it('confirms titles only from the exact visible conversation and sidebar row', () => {
+  const previous = '11111111-1111-4111-8111-111111111111';
+  const current = '22222222-2222-4222-8222-222222222222';
+  dom.window.history.replaceState(null, '', '/c/' + previous);
+  document.title = 'Old name - ChatGPT';
+  document.body.insertAdjacentHTML('beforeend',
+    '<a data-sidebar-item="true" href="/c/' + previous + '"><span dir="auto">Old name</span></a>');
+  expect(api.confirmedConversationTitle(previous)).toBe('Old name');
+
+  dom.window.history.replaceState(null, '', '/g/project/c/' + current);
+  expect(api.confirmedConversationTitle(previous)).toBeNull();
+  expect(api.confirmedConversationTitle(current)).toBeNull();
+  document.body.insertAdjacentHTML('beforeend',
+    '<a data-sidebar-item="true" href="/g/project/c/' + current + '"><span dir="auto">New name</span></a>');
+  expect(api.confirmedConversationTitle(current)).toBeNull();
+  document.title = 'New name - ChatGPT';
+  expect(api.confirmedConversationTitle(current)).toBe('New name');
+  const row = document.querySelector<HTMLAnchorElement>('a[href$="' + current + '"]')!;
+  row.title = 'New name';
+  const label = row.querySelector('span')!;
+  label.textContent = 'Stale name';
+  expect(api.confirmedConversationTitle(current)).toBeNull();
+  label.textContent = '';
+  expect(api.confirmedConversationTitle(current)).toBe('New name');
+  label.textContent = 'New name';
+  row.title = 'Stale name';
+  expect(api.confirmedConversationTitle(current)).toBeNull();
+  row.title = 'New name';
+  expect(api.confirmedConversationTitle(current)).toBe('New name');
+  row.hidden = true;
+  expect(api.confirmedConversationTitle(current)).toBeNull();
+  row.hidden = false;
+  row.append(document.createElement('input'));
+  expect(api.confirmedConversationTitle(current)).toBeNull();
+  row.remove();
+  Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
+  document.body.insertAdjacentHTML('beforeend',
+    '<nav><a href="/c/' + current + '"><span dir="auto">New name</span></a></nav>');
+  expect(api.confirmedConversationTitle(current)).toBe('New name');
+  document.body.insertAdjacentHTML('beforeend',
+    '<nav><a href="/c/' + current + '"><span dir="auto">Older name</span></a></nav>');
+  expect(api.confirmedConversationTitle(current)).toBeNull();
+});
 
 it('reads the September search-unit renderer without legacy message attributes', () => {
   const turn = document.createElement('div');
@@ -477,7 +523,278 @@ describe('native Project entry readiness', () => {
     const entered = api.enterProject(entry, undefined, failure);
     await vi.advanceTimersByTimeAsync(12_500);
     expect(await entered).toBe(false);
-    expect(failure).toHaveBeenCalledWith('transition-timeout:last=composer-not-ready');
+    expect(failure).toHaveBeenCalledWith('transition-timeout:last=composer-not-ready:draft=no-editor:clears=0:chips=0');
+  });
+
+  // #2068: within one tab ChatGPT keeps the Project home's text after it was sent, so the next resume
+  // found its predecessor's brief there and gave up. Only a brief this page typed itself, unchanged, is
+  // cleared (CodeRabbit on #2069); anything else stays and the entry fails as before.
+  it.each([
+    ['a brief this page typed', 'own', true],
+    ['the same brief with a hard line break ChatGPT escaped', 'escaped', true],
+    ['that brief with a person\'s note added', 'edited', false],
+    ['a brief this page never typed', 'foreign', false],
+    ['a person\'s own words', 'person', false]
+  ] as const)('on the Project home, clears %s only when it is the app\'s own', async (_name, kind, cleared) => {
+    const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
+    const brief = resumeBootstrapText('# TASK — the original goal\n\nShip the mail service.', 'pTYR0VjLJ5Xtz2FHFqajqA');
+    document.execCommand = (command: string, _ui?: boolean, value?: string) => {
+      const selection = document.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range) return false;
+      if (command === 'delete') { range.deleteContents(); return true; }
+      if (command !== 'insertHTML') return false;
+      range.deleteContents();
+      const template = document.createElement('template');
+      template.innerHTML = value || '';
+      range.insertNode(template.content);
+      return true;
+    };
+    const link = sourceLink();
+    box.textContent = '';
+    // The previous resume, typed and sent from this page.
+    if (kind !== 'foreign') { expect(api.insertPrompt(brief, true)).toBe(true); box.textContent = ''; }
+    // A hard line break inside one paragraph: ChatGPT stores it as a backslash before the line feed.
+    const left = kind === 'escaped' ? brief.replace(']]\n\n', ']]\\\n') : kind === 'edited' ? `${brief}\n\nAlso check the SMTP port.`
+      : kind === 'person' ? 'Remember to ask about the SMTP port' : brief;
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: projectUrl });
+      box.replaceChildren(...left.split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; }));
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(cleared);
+    if (cleared) expect(box.textContent).toBe('');
+    else {
+      // What kept it is said in the reason (#2159): a person's words and a brief this page never typed are not the same thing.
+      // A brief also says how long the kept draft is and how many briefs this page remembers typing, with their
+      // lengths, never any of the text: a draft that is not one of those lengths was rewritten on its way back.
+      const compact = (text: string) => text.replace(/\\(?=\r?\n)/g, '').replace(/\\(?=[!-/:-@[-`{-~])/g, '').replace(/\s+/g, '');
+      const size = kind === 'person' ? '' : kind === 'foreign' ? `:len=${compact(left).length}:typed=0`
+        : `:len=${compact(left).length}:typed=1:lens=${compact(brief).length}`;
+      expect(failure).toHaveBeenCalledWith(`transition-timeout:last=composer-not-ready:draft=${kind === 'person' ? 'other' : 'brief-foreign'}:clears=0:chips=0${size}`);
+      expect(box.textContent?.length).toBeGreaterThan(0);
+    }
+  });
+  it('names the lengths of the four briefs this page typed most recently, newest first, when it keeps a brief (#2159)', async () => {
+    const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
+    const brief = resumeBootstrapText('# TASK — the original goal\n\nShip the mail service.', 'pTYR0VjLJ5Xtz2FHFqajqA');
+    dom.window.localStorage.setItem('clf-typed-briefs-v1', JSON.stringify(['101:a', '102:b', '103:c', '104:d', '105:e']));
+    const link = sourceLink();
+    box.textContent = '';
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: projectUrl });
+      box.replaceChildren(...brief.split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; }));
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(false);
+    expect(failure).toHaveBeenCalledWith(`transition-timeout:last=composer-not-ready:draft=brief-foreign:clears=0:chips=0:len=${brief.replace(/\s+/g, '').length}:typed=5:lens=105/104/103/102`);
+  });
+  it('adds no numbers to a reason that is not about a draft the app knows, even when the editor holds a brief (#2159)', async () => {
+    const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
+    const brief = resumeBootstrapText('# TASK — the original goal\n\nShip the mail service.', 'pTYR0VjLJ5Xtz2FHFqajqA');
+    const link = sourceLink();
+    box.textContent = '';
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: projectUrl });
+      box.replaceChildren(...brief.split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; }));
+      box.setAttribute('contenteditable', 'false');
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(false);
+    expect(failure).toHaveBeenCalledWith('transition-timeout:last=composer-not-ready:draft=readonly:clears=0:chips=0');
+  });
+  it('lists a brief typed again as the newest one even when the page storage is unavailable (#2159)', async () => {
+    const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
+    const first = resumeBootstrapText('# TASK — A\n\nShip.', 'pTYR0VjLJ5Xtz2FHFqajqA');
+    const second = resumeBootstrapText('# TASK — B, a longer goal\n\nShip the mail service now.', 'pTYR0VjLJ5Xtz2FHFqajqA');
+    const compact = (text: string) => text.replace(/\s+/g, '').length;
+    expect(compact(first)).not.toBe(compact(second));
+    document.execCommand = (command: string, _ui?: boolean, value?: string) => {
+      const selection = document.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range) return false;
+      if (command === 'delete') { range.deleteContents(); return true; }
+      if (command !== 'insertHTML') return false;
+      range.deleteContents();
+      const template = document.createElement('template');
+      template.innerHTML = value || '';
+      range.insertNode(template.content);
+      return true;
+    };
+    vi.spyOn(dom.window.Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('storage unavailable'); });
+    vi.spyOn(dom.window.Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('storage unavailable'); });
+    const link = sourceLink();
+    box.textContent = '';
+    for (const text of [first, second, first]) { expect(api.insertPrompt(text, true)).toBe(true); box.textContent = ''; }
+    const kept = `${first}\n\nAlso check the SMTP port.`;
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: projectUrl });
+      box.replaceChildren(...kept.split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; }));
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(false);
+    expect(failure).toHaveBeenCalledWith(`transition-timeout:last=composer-not-ready:draft=brief-foreign:clears=0:chips=0:len=${compact(kept)}:typed=2:lens=${compact(first)}/${compact(second)}`);
+  });
+
+  // 2026-11-12 (Windows VM, Project chat started through the app): ChatGPT also keeps the Project home's text
+  // after the app's FIRST message of a chat was sent from there (its context block, the message and the
+  // connector mention's label). The next Compact & Resume in that Project found it, waited for an empty
+  // editor and gave up: "could not open the source Project", every time. That message is the app's own, so
+  // it is recognised like a brief; the mention label that follows it is allowed, a person's words are not.
+  it.each([
+    ['the first message of a chat this app typed, followed by its mention label', 'own', ' Chat On Steroids Core', true],
+    ['that message with no label', 'own', '', true],
+    ['that message followed by a label that is not this installation\'s connector', 'own', ' Some Other App', false],
+    ['that message followed by a person\'s note', 'own', '\n\nAlso check the SMTP port, please, and then summarise what you found about the mail service in three short paragraphs for the team lead.', false],
+    ['a first message this app never typed', 'foreign', ' Chat On Steroids Core', false]
+  ] as const)('on the Project home, clears %s only when it is the app\'s own', async (_name, kind, suffix, cleared) => {
+    const typed = '[[COS_CONTEXT:21006]]You are a coding agent working with the user.\n\nRoots: /project\n[[/COS_CONTEXT]]Compaction live test: reply with exactly PROJ-OK-1.';
+    document.execCommand = (command: string, _ui?: boolean, value?: string) => {
+      const selection = document.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range) return false;
+      if (command === 'delete') { range.deleteContents(); return true; }
+      if (command !== 'insertHTML') return false;
+      range.deleteContents();
+      const template = document.createElement('template');
+      template.innerHTML = value || '';
+      range.insertNode(template.content);
+      return true;
+    };
+    const link = sourceLink();
+    box.textContent = '';
+    // The first message, typed and sent from this page; ChatGPT keeps its text on the Project home.
+    if (kind === 'own') { expect(api.insertPrompt(typed, true)).toBe(true); box.textContent = ''; }
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: projectUrl });
+      box.replaceChildren(...(typed + suffix).split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; }));
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(cleared);
+    if (cleared) expect(box.textContent).toBe('');
+    else {
+      expect(failure).toHaveBeenCalledWith(expect.stringMatching(/^transition-timeout:last=composer-not-ready:draft=context-foreign:clears=0:chips=0:len=\d+:typed=\d+(:lens=\d+(\/\d+)*)?$/));
+      expect(box.textContent?.length).toBeGreaterThan(0);
+    }
+  });
+
+  // #2115: the page that typed a brief is gone (a reload, an app restart, another tab); ChatGPT still holds the
+  // text in the Project home. The brief is the app's own whoever typed it, so it is recognised from storage.
+  // ChatGPT may also put the draft back after it was cleared, so one clear is not enough.
+  it.each([
+    ['a brief an earlier page of this tab typed', 0, true],
+    ['that brief put back twice while the source turns are still going away', 2, true],
+    ['that brief put back four times (it stops, so a busy page cannot loop forever)', 4, false]
+  ] as const)('on the Project home, clears %s', async (_name, restores, cleared) => {
+    const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
+    const brief = resumeBootstrapText('# TASK — the original goal\n\nShip the mail service.', 'pTYR0VjLJ5Xtz2FHFqajqA');
+    document.execCommand = (command: string, _ui?: boolean, value?: string) => {
+      const selection = document.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range) return false;
+      if (command === 'delete') { range.deleteContents(); return true; }
+      if (command !== 'insertHTML') return false;
+      range.deleteContents();
+      const template = document.createElement('template');
+      template.innerHTML = value || '';
+      range.insertNode(template.content);
+      return true;
+    };
+    box.textContent = '';
+    expect(api.insertPrompt(brief, true)).toBe(true);
+    box.textContent = '';
+    // The page reloads: its memory of what it typed is gone, the stored fingerprint is not.
+    dom.window.eval(source);
+    api = (dom.window as unknown as { CLF_DOM: DomApi }).CLF_DOM;
+    const put = () => box.replaceChildren(...brief.split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; }));
+    const link = sourceLink();
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: projectUrl });
+      put();
+      // The source chat's turns are still on the page for a moment, and ChatGPT puts the draft back meanwhile.
+      user('Earlier turn');
+      for (let index = 1; index <= restores; index++) setTimeout(() => { if (box.textContent === '') put(); }, 400 * index);
+      setTimeout(() => { document.querySelector('[data-testid="conversation-turn-1"]')?.remove(); }, 400 * (restores + 1));
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(cleared);
+    // The app knows this brief and still gave up: the reason says it was the limit on clears, not the recognition.
+    if (!cleared) expect(failure).toHaveBeenCalledWith(expect.stringMatching(/^transition-timeout:last=composer-not-ready:draft=brief-own:clears=3:chips=0:len=\d+:typed=\d+(:lens=\d+(\/\d+)*)?$/));
+  });
+
+  // #2159 (2.1.53, the reporter's Project home): the draft ChatGPT keeps ends with the connector mention as a chip that
+  // names the app as it is called now. An app renamed in ChatGPT shows under a name the app does not list, but the
+  // chip carries the app's id, and the app proved that id is its own. Another app's chip is not.
+  it.each([
+    ['this installation\'s own app, renamed in ChatGPT', 'asdk_app_6ac261da79588191af4e6096fadeeee2', '', true, 'brief-own', 1],
+    ['an app that is not this installation\'s', 'asdk_app_00000000000000000000000000000000', '', false, 'brief-foreign', 1],
+    // CodeRabbit on #2185: the foreign chip's label would pass for a connector name once the own chip is gone.
+    ['this installation\'s own app, renamed, and then another app named like a connector', 'asdk_app_6ac261da79588191af4e6096fadeeee2', 'Chat On Steroids Core', false, 'brief-foreign', 2]
+  ] as const)('on the Project home, clears a brief that ends with the mention chip of %s only when its id is the app\'s own', async (_name, chipId, foreignLabel, cleared, kind, chips) => {
+    const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
+    const brief = resumeBootstrapText('# TASK — the original goal\n\nShip the mail service.', 'pTYR0VjLJ5Xtz2FHFqajqA');
+    document.execCommand = (command: string, _ui?: boolean, value?: string) => {
+      const selection = document.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range) return false;
+      if (command === 'delete') { range.deleteContents(); return true; }
+      if (command !== 'insertHTML') return false;
+      range.deleteContents();
+      const template = document.createElement('template');
+      template.innerHTML = value || '';
+      range.insertNode(template.content);
+      return true;
+    };
+    api.setConnectorApps({ core: [{ appId: 'asdk_app_6ac261da79588191af4e6096fadeeee2', linkId: null, name: 'Handoff Helper' }] });
+    const link = sourceLink();
+    box.textContent = '';
+    expect(api.insertPrompt(brief, true)).toBe(true);
+    box.textContent = '';
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: projectUrl });
+      const paragraphs = brief.split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; });
+      const chip = document.createElement('span');
+      chip.setAttribute('app-mention-path', `app://${chipId}`);
+      chip.setAttribute('data-prompt-link-href', `app://${chipId}`);
+      chip.innerHTML = '<span class="Label">Handoff Helper</span>';
+      paragraphs.at(-1)!.append(chip);
+      if (foreignLabel) {
+        const foreign = document.createElement('span');
+        foreign.setAttribute('app-mention-path', 'app://asdk_app_00000000000000000000000000000000');
+        foreign.setAttribute('data-prompt-link-href', 'app://asdk_app_00000000000000000000000000000000');
+        foreign.innerHTML = `<span class="Label">${foreignLabel}</span>`;
+        paragraphs.at(-1)!.append(foreign);
+      }
+      box.replaceChildren(...paragraphs);
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(cleared);
+    if (cleared) expect(box.textContent).toBe('');
+    else {
+      expect(failure).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`^transition-timeout:last=composer-not-ready:draft=${kind}:clears=0:chips=${chips}:len=\\d+:typed=1:lens=\\d+$`)));
+      expect(box.textContent?.length).toBeGreaterThan(0);
+    }
   });
 
   it('reports visible source turns as the last observation when the Project transition times out', async () => {
@@ -495,9 +812,100 @@ describe('native Project entry readiness', () => {
     expect(failure).toHaveBeenCalledWith('transition-timeout:last=source-turns-remain');
   });
 
+  // CodeRabbit on #2190: the source chat and the Project home are two places ChatGPT can put a draft back into. Three
+  // clears spent in the source chat must not leave the Project home's restored brief without its own.
+  it('clears a brief restored in the Project home even after three clears were spent in the source chat', async () => {
+    const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
+    const brief = resumeBootstrapText('# TASK — the original goal\n\nShip the mail service.', 'pTYR0VjLJ5Xtz2FHFqajqA');
+    const request = '[[CLF-HANDOFF:9cY6SN6A7R4hDbXp7mNVCg]]\n\nChat On Steroids is compacting this conversation. Write the handoff as one reply.';
+    document.execCommand = (command: string, _ui?: boolean, value?: string) => {
+      const selection = document.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range) return false;
+      if (command === 'delete') { range.deleteContents(); return true; }
+      if (command !== 'insertHTML') return false;
+      range.deleteContents();
+      const template = document.createElement('template');
+      template.innerHTML = value || '';
+      range.insertNode(template.content);
+      return true;
+    };
+    const put = (text: string) => box.replaceChildren(...text.split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; }));
+    box.textContent = '';
+    expect(api.insertPrompt(brief, true)).toBe(true);
+    box.textContent = '';
+    expect(api.insertPrompt(request, true)).toBe(true);
+    put(request);
+    const link = sourceLink();
+    // The Project link is not on the page yet, so the entry keeps waiting in the source chat while ChatGPT puts the
+    // request back twice after the first clear: three clears in all, the whole budget.
+    const parent = link.parentNode as Node;
+    link.remove();
+    setTimeout(() => parent.appendChild(link), 1_000);
+    let clicked = false, restores = 2;
+    const restore = setInterval(() => { if (!clicked && restores > 0 && box.textContent === '') { restores--; put(request); } }, 100);
+    link.addEventListener('click', event => {
+      event.preventDefault(); clicked = true;
+      dom.reconfigure({ url: projectUrl });
+      put(brief);
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(61_000);
+    clearInterval(restore);
+    const result = await entered;
+    expect(failure.mock.calls).toEqual([]);
+    expect(result).toBe(true);
+    expect(box.textContent).toBe('');
+  });
+
+  // 2026-11-14 (Windows VM, second Compact & Resume in one Project, 2.1.53): ChatGPT put the handoff request the app had
+  // just sent back into the source chat's composer as a draft. The entry waits for an empty source editor before its one
+  // click, so it gave up after 60 s ("source-not-ready", nothing sent). A composer holding only the handoff request this
+  // app typed, unchanged, is the app's own text like a brief: emptied; anything a person changed or wrote stays.
   it.each([
-    ['missing', 'source-ready-timeout:last=source-not-ready'],
-    ['draft', 'source-ready-timeout:last=source-not-ready'],
+    ['the handoff request this app typed', 'own', true],
+    ['that request with a person\'s words added', 'edited', false],
+    ['a handoff request this app never typed', 'foreign', false]
+  ] as const)('before the click, empties a source composer that holds %s only when it is the app\'s own', async (_name, kind, cleared) => {
+    const typed = '[[CLF-HANDOFF:9cY6SN6A7R4hDbXp7mNVCg]]\n\nChat On Steroids is compacting this conversation. Write the handoff as one reply.';
+    document.execCommand = (command: string, _ui?: boolean, value?: string) => {
+      const selection = document.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range) return false;
+      if (command === 'delete') { range.deleteContents(); return true; }
+      if (command !== 'insertHTML') return false;
+      range.deleteContents();
+      const template = document.createElement('template');
+      template.innerHTML = value || '';
+      range.insertNode(template.content);
+      return true;
+    };
+    const link = sourceLink();
+    box.textContent = '';
+    if (kind !== 'foreign') expect(api.insertPrompt(typed, true)).toBe(true);
+    const left = kind === 'edited' ? `${typed}\n\nAlso list the open pull requests.` : typed;
+    box.replaceChildren(...left.split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; }));
+    let clicks = 0;
+    link.addEventListener('click', event => {
+      event.preventDefault(); clicks++;
+      dom.reconfigure({ url: projectUrl });
+      box.textContent = '';
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(await entered).toBe(cleared);
+    expect(clicks).toBe(cleared ? 1 : 0);
+    if (!cleared) {
+      expect(failure).toHaveBeenCalledWith(expect.stringMatching(/^source-ready-timeout:last=source-not-ready:draft=handoff-foreign:clears=0:chips=0:len=\d+:typed=\d+(:lens=\d+(\/\d+)*)?$/));
+      expect(box.textContent?.length).toBeGreaterThan(0);
+    }
+  });
+
+  it.each([
+    ['missing', 'source-ready-timeout:last=source-not-ready:draft=no-editor:clears=0:chips=0'],
+    ['draft', 'source-ready-timeout:last=source-not-ready:draft=other:clears=0:chips=0'],
     ['cancelled', 'current-lost'],
     ['foreign-route', 'wrong-route-before-click']
   ])('never clicks an unready or retired source: %s', async (reason, expectedFailure) => {
@@ -1056,6 +1464,33 @@ describe('native image readiness', () => {
     expect(await draft.clear()).toBe(true);
     expect(api.hasComposerAttachments()).toBe(false); draft.dispose();
   });
+
+  it('sends once when a PNG tile finishes by updating its filename text in place', async () => {
+    const input = upload();
+    input.accept = '';
+    const attachments = document.createElement('div');
+    attachments.setAttribute('data-composer-attachments', '');
+    attachments.innerHTML = '<span><span><span>Uploading</span><button type="button" aria-label="capture.png"></button></span><button type="button" aria-label="Quitar"></button></span>';
+    const filename = attachments.querySelector('span span span')!.firstChild!;
+    input.addEventListener('change', () => document.querySelector('form')!.append(attachments));
+    const file = new dom.window.File(['image bytes'], 'capture.png', { type: 'image/png' });
+    const authorize = vi.fn(async () => true);
+    const click = vi.fn(() => user('Exact app prompt'));
+    button.addEventListener('click', click);
+    const delivery = api.uploadImages([], () => true, undefined, [file])
+      .then(ready => ready && api.send({ beforeSend: authorize }));
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(authorize).not.toHaveBeenCalled();
+    expect(click).not.toHaveBeenCalled();
+
+    filename.nodeValue = file.name;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(authorize).toHaveBeenCalledTimes(1);
+    expect(click).toHaveBeenCalledTimes(1);
+    await expect(delivery).resolves.toBe(true);
+  });
+
   // #1942 (2026-10-30): in German the remove label is "<name> entfernen", the name first, so no file was
   // ever recognized and every message with an attachment hung until "upload not confirmed".
   it.each([['German', 'notes.zip entfernen'], ['no name in the label', 'Datei entfernen']])('accepts the two-button file tile whatever its remove label says (%s)', async (_case, removal) => {
@@ -1071,6 +1506,28 @@ describe('native image readiness', () => {
     expect(api.hasComposerAttachments()).toBe(true);
     draft.dispose();
   });
+  // #1986 (2026-11-01, Spanish ChatGPT on Windows): the open button's label is the file name twice, and
+  // the remove label repeats it too; the tile was never recognized and the message waited 10 minutes.
+  it('accepts a file tile whose open label repeats the name twice, by the name it shows', async () => {
+    const input = upload(); input.accept = '';
+    const draft = api.captureComposerDraft('Exact app prompt');
+    input.addEventListener('change', () => {
+      const host = document.createElement('div'); host.setAttribute('data-composer-attachments', '');
+      host.innerHTML = '<span><span><span>notes.zip</span><button type="button" aria-label="notes.zipnotes.zip"></button></span><button type="button" aria-label="Quitar notes.zipnotes.zip"></button></span>';
+      document.querySelector('form')!.append(host);
+    });
+    const file = new dom.window.File(['exact bytes'], 'notes.zip', { type: 'application/zip' });
+    expect(await api.uploadImages([], () => true, draft, [file])).toBe(true);
+    expect(api.hasComposerAttachments()).toBe(true);
+    draft.dispose();
+  });
+  it.each([['a different name repeated', 'other.zipother.zip'], ['the name and more', 'notes.zip (copy)'], ['the name three times', 'notes.zipnotes.zipnotes.zip']])(
+    'still refuses an open label that is not the shown name or exactly it twice (%s)', (_case, label) => {
+      const host = document.createElement('div'); host.setAttribute('data-composer-attachments', '');
+      host.innerHTML = `<span><span><span>notes.zip</span><button type="button" aria-label="${label}"></button></span><button type="button" aria-label="Quitar ${label}"></button></span>`;
+      document.querySelector('form')!.append(host);
+      expect(api.hasComposerAttachments()).toBe(false);
+    });
   // CodeRabbit on #1944: a blank label, or the file name with spaces around it, names no remove control.
   it.each(['notes.zip', ' notes.zip ', '   ', ''])('still refuses a tile whose second button is not a remove control (label "%s")', label => {
     const host = document.createElement('div'); host.setAttribute('data-composer-attachments', '');
@@ -1125,6 +1582,62 @@ describe('native image readiness', () => {
     const originals = files ? [new dom.window.File(['bytes'], image.name, { type: 'image/webp' })] : [];
     expect(await api.uploadImages(files ? [] : [image], () => true, undefined, originals)).toBe(true);
     expect(wrong).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { scenario: 'matching PNG', expected: true },
+    { scenario: 'different bytes', data: 'Yg==' },
+    { scenario: 'different name', name: 'other(20261119-233120).png' },
+    { scenario: 'extra attachment', extra: true },
+    { scenario: 'disabled Send', disabled: true },
+    { scenario: 'draft becomes stale during the read', stale: true },
+  ])('checks the original bytes before sending a timestamped attachment ($scenario)', async ({
+    name = 'image(20261119-233120).png', data = 'YQ==', extra = false, disabled = false, stale = false, expected = false
+  }) => {
+    const input = upload();
+    input.accept = '';
+    let current = true;
+    const stillCurrent = () => current;
+    const draft = api.captureComposerDraft('Exact app prompt', stillCurrent);
+    const recordAttachments = vi.spyOn(draft, 'attachments');
+    const originalRead = dom.window.FileReader.prototype.readAsDataURL;
+    const read = vi.spyOn(dom.window.FileReader.prototype, 'readAsDataURL').mockImplementation(function (this: FileReader, file) {
+      originalRead.call(this, file);
+      if (stale) current = false;
+    });
+    const authorize = vi.fn(async () => true);
+    const click = vi.fn(() => user('Exact app prompt'));
+    button.addEventListener('click', click);
+    button.disabled = disabled;
+    input.addEventListener('change', () => {
+      const area = document.createElement('div');
+      area.setAttribute('data-composer-attachments', '');
+      area.innerHTML = `<div role="button" aria-label="${name}"><img alt="${name}" src="data:image/png;base64,${data}"><button type="button" aria-label="Quitar ${name}"></button></div>`;
+      if (extra) area.insertAdjacentHTML('beforeend', '<button type="button" aria-label="Other attachment"></button>');
+      input.form!.append(area);
+    });
+    const file = new dom.window.File(['a'], 'image.png', { type: 'image/png' });
+    try {
+      const delivery = api.uploadImages([], stillCurrent, draft, [file])
+        .then(ready => ready && draft.current() && api.send({ beforeSend: authorize }));
+      const settled = vi.fn();
+      void delivery.then(settled);
+
+      if (expected || stale) {
+        await vi.waitFor(() => expect(settled).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+      } else {
+        await vi.advanceTimersByTimeAsync(600_000);
+      }
+      await expect(delivery).resolves.toBe(expected);
+      if (stale) expect(read).toHaveBeenCalledTimes(1);
+      if (disabled) expect(read).not.toHaveBeenCalled();
+      expect(recordAttachments).toHaveBeenCalledTimes(expected ? 1 : 0);
+      expect(authorize).toHaveBeenCalledTimes(expected ? 1 : 0);
+      expect(click).toHaveBeenCalledTimes(expected ? 1 : 0);
+    } finally {
+      draft.dispose();
+      read.mockRestore();
+    }
   });
   it.each(['duplicate', 'disabled', 'foreign'])('does not dispatch an upload with %s native ownership', async reason => {
     const input = upload(); const changed = vi.fn(); input.addEventListener('change', changed);
@@ -1508,6 +2021,19 @@ describe('rendered temporary-chat state independent of language', () => {
     currentToggle(label, true);
     expect(api.temporaryChatReady()).toBe(true);
   });
+  it.each([[true, true], [false, false]])('reads the checked glyph behind the codex-icon- sprite prefix (checked %s)', (checked, active) => {
+    // The sprite ids gained a `codex-icon-` prefix on 2026-11-02 (see the microphone anchor).
+    const control = toggle('beliebig', checked);
+    for (const use of control.querySelectorAll('use')) use.setAttribute('href', use.getAttribute('href')!.replace('#chat-temp', '#codex-icon-chat-temp'));
+    expect(api.temporaryChatReady()).toBe(active);
+  });
+  it('does not take a checked glyph whose own <use> is hidden', () => {
+    const control = toggle('beliebig', false);
+    // The visible svg holds the checked glyph, but the <use> element itself is hidden.
+    const svg = control.querySelector('svg')!;
+    svg.innerHTML = '<use href="/cdn/assets/icons-anyhash.svg#codex-icon-chat-temp-checked" style="display:none"></use>';
+    expect(api.temporaryChatReady()).toBe(false);
+  });
   it('does not mistake the current three-path inactive temporary-chat icon for active mode', () => {
     currentToggle('Temporary chat', false);
     expect(api.temporaryChatReady()).toBe(false);
@@ -1604,6 +2130,26 @@ describe('locale-independent provider composer evidence', () => {
       '<div><button type="button" aria-label="Sprachchat starten"><svg><use href="/cdn/sprites.svg#voice-regular-20"></use></svg></button></div></div></div>';
     expect(api.sendButton()).toBeNull();
     expect(api.composerActions()).toEqual({ host: document.getElementById('row'), before: document.getElementById('mic-wrap') });
+  });
+
+  it.each(['microphone-light-20', 'codex-icon-microphone-light-20'])('anchors to the microphone whatever prefix the sprite carries (%s)', glyph => {
+    // ChatGPT 2026-11-02 (German UI, logged in): the sprite ids gained a `codex-icon-` prefix
+    // (`#codex-icon-microphone-light-20`, `#codex-icon-voice-regular-20`), so an empty composer
+    // had no anchor again and the app's composer control never appeared until something was typed.
+    document.documentElement.lang = 'de-DE';
+    document.querySelector('form')!.innerHTML = '<div id="prompt-textarea" contenteditable="true"></div>' +
+      '<div class="flex justify-end"><div><div><span><button type="button" aria-label="ChatGPT-Modell auswählen">5.6</button></span></div></div>' +
+      `<div id="row"><div id="mic-wrap" class="flex shrink-0 items-center empty:hidden"><button type="button" aria-label="Diktieren"><svg><use href="/cdn/assets/icons-anyhash.svg#${glyph.replace('20', '16')}"></use></svg><svg><use href="/cdn/assets/icons-anyhash.svg#${glyph}"></use></svg></button></div>` +
+      '<div><button type="button" aria-label="Sprachchat starten"><svg><use href="/cdn/assets/icons-anyhash.svg#codex-icon-voice-regular-20"></use></svg></button></div></div></div>';
+    expect(api.sendButton()).toBeNull();
+    expect(api.composerActions()).toEqual({ host: document.getElementById('row'), before: document.getElementById('mic-wrap') });
+  });
+
+  it('does not take a sprite that only ends like the microphone for it', () => {
+    button.parentElement!.removeAttribute('data-testid');
+    button.removeAttribute('data-testid'); button.removeAttribute('aria-label');
+    button.innerHTML = '<svg><use href="#codex-icon-notmicrophone-light-20"></use></svg>';
+    expect(api.composerActions()).toBeNull();
   });
 
   it('does not anchor to a microphone glyph in prose or outside the composer', () => {
